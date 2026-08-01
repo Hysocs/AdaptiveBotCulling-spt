@@ -1,0 +1,2019 @@
+using System;
+using System.Collections.Generic;
+using System.Reflection;
+using BepInEx;
+using BepInEx.Configuration;
+using EFT;
+using EFT.Interactive;
+using EFT.InventoryLogic;
+using FastAnimatorSystem;
+using HarmonyLib;
+using UnityEngine;
+using UnityEngine.AI;
+
+namespace AdaptiveBotCulling
+{
+    [BepInPlugin(Guid, Name, Version)]
+    public sealed class Plugin : BaseUnityPlugin
+    {
+        public const string Guid = "com.hysocs.adaptivebotculling"; public const string Name = "Adaptive Bot Culling"; public const string Version = "0.23.1";
+
+        private const float VisibilityHoldSeconds = 1.5f;
+        private const float WanderIntervalSeconds = 2f;
+        private const float WanderStepDistance = 2.5f;
+        private const float RestStartStamina = 0.15f;
+        private const float RestEndStamina = 0.65f;
+        private const float VisionRange = 150f;
+        private const float VisionInterval = 0.2f;
+        private const float VisionConfirmSeconds = 1f;
+        private const float CombatMemorySeconds = 12f;
+
+        private static readonly int VisibilityMask =
+            Physics.DefaultRaycastLayers &
+            ~(int)LayerMaskClass.Grass &
+            ~(int)LayerMaskClass.Foliage;
+
+        private sealed class BodyAnimatorState
+        {
+            public Animator Animator;
+            public bool OriginalEnabled;
+            public float NextRefresh;
+            public float NextVisibilityUpdate;
+            public Transform Head;
+            public Transform Chest;
+            public bool IsVisible;
+            public bool RayVisible;
+            public float ActiveUntil;
+            public float NextWanderUpdate;
+            public Vector3[] WanderCorners;
+            public int WanderCorner;
+            public bool WasWandering;
+            public bool VisibleWanderActive;
+            public float NextVisibleWanderUpdate;
+            public Vector3 VisibleDestination;
+            public Vector3 QueuedVisibleDestination;
+            public bool HasQueuedVisibleDestination;
+            public bool VisibleWanderSlowing;
+            public float ResumeSprintAt;
+            public LootItem LootTarget;
+            public Vector3 LootApproachPosition;
+            public int ReservedLootId;
+            public Player GroupLeader;
+            public int DesiredGroupSize;
+            public float NextGroupUpdate;
+            public Vector3 FormationOffset;
+            public bool HasFormationOffset;
+            public float NextFormationCorrection;
+            public bool GroupResting;
+            public bool AppliedResting;
+            public Player RestAnchor;
+            public float NextEmergencyRegroup;
+            public float NextFollowerRouteCommand;
+            public float NextVisionCheck;
+            public float VisionVisibleSeconds;
+            public bool PlayerConfirmed;
+            public bool VisionStoppedMovement;
+            public bool CombatCoverActive;
+            public float NextCoverSearch;
+            public float NextCombatDiagnostic;
+            public Vector3 LastKnownPlayerPosition;
+            public CustomNavigationPoint CombatCoverPoint;
+            public Vector3 CombatCoverPosition;
+            public float OpeningFireUntil;
+            public bool CoverCommitted;
+            public bool AtCover;
+            public float NextPeek;
+            public float LastSeenPlayerTime;
+            public bool HasCurrentVisual;
+            public float NextStrafeSearch;
+            public bool PeekLeft;
+            public bool MovingToPeek;
+            public readonly HashSet<int> ColliderIds = new HashSet<int>();
+        }
+
+        private static Plugin _instance;
+        private readonly HashSet<BotOwner> _bots = new HashSet<BotOwner>();
+        private readonly List<BotOwner> _removedBots = new List<BotOwner>();
+        private readonly Dictionary<Player, BodyAnimatorState> _bodyStates =
+            new Dictionary<Player, BodyAnimatorState>();
+        private readonly List<LootItem> _looseLoot = new List<LootItem>();
+        private readonly Dictionary<int, Player> _lootReservations =
+            new Dictionary<int, Player>();
+
+        private ConfigEntry<bool> _disableAi;
+        private ConfigEntry<bool> _disableBodyAnimator;
+        private ConfigEntry<bool> _simpleHiddenWander;
+        private Harmony _harmony;
+        private Player _mainPlayer;
+        private Camera _camera;
+        private GameWorld _gameWorld;
+        private float _nextCameraRefresh;
+        private float _nextLootRefresh;
+        private readonly RaycastHit[] _visibilityHits = new RaycastHit[64];
+        private readonly HashSet<int> _localPlayerColliderIds = new HashSet<int>();
+        private readonly HashSet<int> _transparentColliderIds = new HashSet<int>();
+        private readonly HashSet<int> _opaqueColliderIds = new HashSet<int>();
+
+        private void Awake()
+        {
+            _instance = this;
+            _disableAi = Config.Bind(
+                "Distance culling",
+                "Disable AI",
+                true,
+                "Replaces native EFT bot updates for every active bot with only the minimal movement pipeline.");
+            _disableBodyAnimator = Config.Bind(
+                "Distance culling",
+                "Disable body Animator",
+                true,
+                "Disables EFT's expensive body output Animator while the bot is culled and hidden.");
+            _simpleHiddenWander = Config.Bind(
+                "Distance culling",
+                "Simple custom wander",
+                false,
+                "Experimental: hidden bots teleport along cached NavMesh paths; rendered bots use smooth EFT movement and sprint.");
+
+            _disableBodyAnimator.SettingChanged += OnBodySettingChanged;
+
+            _harmony = new Harmony(Guid);
+            Patch(AccessTools.Method(typeof(BotOwner), nameof(BotOwner.PreActivate)), nameof(RegisterBot), false);
+            Patch(AccessTools.Method(typeof(BotOwner), "method_10", Type.EmptyTypes), nameof(BotActivated), false);
+            Patch(AccessTools.Method(typeof(BotOwner), nameof(BotOwner.UpdateManual)), nameof(AllowBotManualUpdate), true);
+            Patch(AccessTools.Method(typeof(BotOwner), nameof(BotOwner.FixedUpdate)), nameof(AllowBotFixedUpdate), true);
+            Patch(
+                AccessTools.Method(typeof(AICoreAgentClass<BotLogicDecision>), nameof(AICoreAgentClass<BotLogicDecision>.Update)),
+                nameof(AllowBrainUpdate),
+                true);
+            Patch(
+                AccessTools.Method(
+                    typeof(Player),
+                    nameof(Player.OnDead),
+                    new[] { typeof(EDamageType) }),
+                nameof(PrepareDeathPose),
+                true);
+            Patch(
+                AccessTools.Method(
+                    typeof(Player),
+                    nameof(Player.CreateCorpse),
+                    Type.EmptyTypes),
+                nameof(PrepareCorpsePose),
+                true);
+            Patch(AccessTools.Method(typeof(GameWorld), nameof(GameWorld.DoWorldTick)), nameof(OnWorldTick), false);
+
+            Logger.LogInfo(
+                "Adaptive Bot Culling 0.23.1 loaded. Peripheral vision falloff + sightline-aware peeking enabled.");
+        }
+
+        private void Patch(MethodBase target, string methodName, bool prefix)
+        {
+            if (target == null)
+            {
+                Logger.LogError("Missing EFT patch target for " + methodName);
+                return;
+            }
+            var patch = new HarmonyMethod(AccessTools.Method(typeof(Plugin), methodName));
+            _harmony.Patch(target, prefix ? patch : null, prefix ? null : patch);
+        }
+
+        private static void RegisterBot(BotOwner __instance)
+        {
+            if (_instance != null && __instance != null)
+                _instance._bots.Add(__instance);
+        }
+
+        private static void BotActivated(BotOwner __instance)
+        {
+            if (_instance == null || __instance == null)
+                return;
+            _instance._bots.Add(__instance);
+            _instance.UpdateBodyAnimator(__instance.GetPlayer, true);
+            _instance.AssignInitialGroup(__instance);
+        }
+
+        private static bool AllowBotManualUpdate(BotOwner __instance)
+        {
+            if (_instance == null || __instance == null ||
+                __instance.BotState != EBotState.Active ||
+                !_instance.ShouldDisableAi(__instance.GetPlayer))
+                return true;
+
+            // Keep only the parts required to follow our path and drive visible
+            // locomotion. Native sensing, goals, shooting and tactics do not run.
+            if (__instance.Mover != null)
+            {
+                __instance.Mover.ManualUpdate();
+                if (__instance.GetPlayer.UpdateQueue == EUpdateQueue.Update)
+                {
+                    __instance.Mover.ManualFixedUpdate();
+                    __instance.Steering?.ManualFixedUpdate();
+                }
+            }
+            if (_instance.IsInCombat(__instance.GetPlayer))
+            {
+                __instance.WeaponManager?.ManualUpdate();
+                __instance.AimingManager?.ManualUpdate();
+                __instance.ShootData?.ManualUpdate();
+                __instance.Tilt?.ManualUpdate();
+            }
+            return false;
+        }
+
+        private static bool AllowBotFixedUpdate(BotOwner __instance)
+        {
+            if (_instance == null || __instance == null ||
+                __instance.BotState != EBotState.Active ||
+                !_instance.ShouldDisableAi(__instance.GetPlayer))
+                return true;
+
+            if (__instance.GetPlayer.UpdateQueue == EUpdateQueue.FixedUpdate)
+            {
+                __instance.Steering?.ManualFixedUpdate();
+                __instance.Mover?.ManualFixedUpdate();
+            }
+            return false;
+        }
+
+        private static bool AllowBrainUpdate(AICoreAgentClass<BotLogicDecision> __instance)
+        {
+            if (_instance == null || __instance == null || !_instance._disableAi.Value)
+                return true;
+
+            BaseBrain brain = __instance.Gclass309_0 as BaseBrain;
+            return brain == null || !IsAlive(brain.Owner?.GetPlayer);
+        }
+
+        private static void PrepareDeathPose(Player __instance)
+        {
+            _instance?.WakeAndStampDeathPose(__instance, true);
+        }
+
+        private static void PrepareCorpsePose(Player __instance)
+        {
+            if (_instance == null)
+                return;
+            _instance.WakeAndStampDeathPose(__instance, false);
+            _instance.ReleaseDeathAnimation(__instance);
+        }
+
+        private void WakeAndStampDeathPose(Player player, bool advanceState)
+        {
+            if (player == null || player.IsYourPlayer || player.PlayerBones == null)
+                return;
+
+            if (_bodyStates.TryGetValue(player, out BodyAnimatorState state))
+            {
+                state.IsVisible = true;
+                state.RayVisible = true;
+                state.ActiveUntil = float.PositiveInfinity;
+                Restore(state);
+            }
+
+            PlayableAnimator playable = player.PlayerBones.PlayableAnimator;
+            if (playable == null || playable.outputAnimator == null)
+                return;
+
+            playable.outputAnimator.enabled = true;
+            if (!playable.Initialized || !playable.Graph.IsValid())
+                return;
+
+            if (advanceState)
+                player.BodyUpdate(Mathf.Max(Time.deltaTime, 0.0001f));
+            playable.Graph.Play();
+            playable.Graph.Evaluate(0f);
+        }
+
+        private void ReleaseDeathAnimation(Player player)
+        {
+            if (player == null || player.PlayerBones == null)
+                return;
+
+            PlayableAnimator playable = player.PlayerBones.PlayableAnimator;
+            if (playable != null)
+            {
+                if (playable.Initialized && playable.Graph.IsValid())
+                    playable.Stop();
+                if (playable.outputAnimator != null)
+                    playable.outputAnimator.enabled = false;
+            }
+
+            // CreateCorpse reuses this hierarchy. Forget the Animator so no
+            // later culling refresh or settings event can re-enable it and pin
+            // the bones against EFT's ragdoll.
+            if (_bodyStates.TryGetValue(player, out BodyAnimatorState state))
+            {
+                ReleaseLootReservation(state);
+                ReleaseCombatCover(state);
+                state.Animator = null;
+                state.OriginalEnabled = false;
+                state.WasWandering = false;
+                ClearWanderPath(state);
+            }
+        }
+
+        private static void OnWorldTick(GameWorld __instance, float dt)
+        {
+            if (_instance == null)
+                return;
+            Player nextMainPlayer = __instance != null ? __instance.MainPlayer : null;
+            _instance._gameWorld = __instance;
+            if (_instance._mainPlayer != nextMainPlayer)
+                _instance.AttachMainPlayer(nextMainPlayer);
+            _instance.Tick();
+        }
+
+        private bool ShouldDisableAi(Player player)
+        {
+            return _disableAi.Value && IsAlive(player);
+        }
+
+        private bool ShouldDisableBodyAnimator(Player player)
+        {
+            return _disableBodyAnimator.Value &&
+                   IsAlive(player) &&
+                   IsCulledAndHidden(player);
+        }
+
+        private bool IsCulledAndHidden(Player player)
+        {
+            if (player == null)
+                return false;
+            return !_bodyStates.TryGetValue(player, out BodyAnimatorState state) ||
+                   !state.IsVisible;
+        }
+
+        private static bool IsAlive(Player player)
+        {
+            return player != null &&
+                   player.HealthController != null &&
+                   player.HealthController.IsAlive;
+        }
+
+        private void Tick()
+        {
+            RefreshCamera();
+            RefreshLooseLoot();
+            _removedBots.Clear();
+            foreach (BotOwner bot in _bots)
+            {
+                if (bot == null)
+                {
+                    _removedBots.Add(bot);
+                    continue;
+                }
+                Player player = bot.GetPlayer;
+                UpdateVisibility(player);
+                MaintainSimpleGroup(bot, player);
+                UpdateStaminaPolicy(bot, player);
+                if (!UpdateVisionAndCombat(bot, player))
+                    UpdateSimpleWander(bot);
+                UpdateBodyAnimator(player, false);
+            }
+            foreach (BotOwner bot in _removedBots)
+                _bots.Remove(bot);
+        }
+
+        private bool UpdateVisionAndCombat(BotOwner bot, Player botPlayer)
+        {
+            if (bot == null || botPlayer == null)
+                return false;
+            if (!_disableAi.Value || !_simpleHiddenWander.Value)
+            {
+                if (_bodyStates.TryGetValue(botPlayer, out BodyAnimatorState disabledState) &&
+                    disabledState.PlayerConfirmed)
+                    ForgetCombatTarget(bot, disabledState);
+                return false;
+            }
+            if (!IsAlive(botPlayer) ||
+                _mainPlayer == null || !IsAlive(_mainPlayer) ||
+                botPlayer.PlayerBones == null || _mainPlayer.PlayerBones == null)
+                return false;
+            if (!_bodyStates.TryGetValue(botPlayer, out BodyAnimatorState state))
+                return false;
+
+            Transform eye = botPlayer.PlayerBones.Head != null
+                ? botPlayer.PlayerBones.Head.Original
+                : null;
+            Transform targetChest = _mainPlayer.PlayerBones.Ribcage != null
+                ? _mainPlayer.PlayerBones.Ribcage.Original
+                : null;
+            Transform targetHead = _mainPlayer.PlayerBones.Head != null
+                ? _mainPlayer.PlayerBones.Head.Original
+                : null;
+            if (eye == null || targetChest == null)
+                return false;
+
+            Vector3 targetDirection = targetChest.position - eye.position;
+            if (state.PlayerConfirmed)
+            {
+                float confirmedNow = Time.unscaledTime;
+                if (confirmedNow >= state.NextVisionCheck)
+                {
+                    state.NextVisionCheck = confirmedNow + VisionInterval +
+                        (botPlayer.GetInstanceID() & 3) * 0.007f;
+                    state.HasCurrentVisual =
+                        IsVisionRayClear(botPlayer, state, eye.position, targetChest.position) ||
+                        (targetHead != null &&
+                         IsVisionRayClear(botPlayer, state, eye.position, targetHead.position));
+                    if (state.HasCurrentVisual)
+                    {
+                        state.LastKnownPlayerPosition = targetChest.position;
+                        state.LastSeenPlayerTime = confirmedNow;
+                    }
+                    else if (confirmedNow - state.LastSeenPlayerTime >= CombatMemorySeconds)
+                    {
+                        ForgetCombatTarget(bot, state);
+                        return false;
+                    }
+                }
+
+                bool playerSeesBot = state.RayVisible;
+                if (!state.CoverCommitted && playerSeesBot &&
+                    confirmedNow < state.OpeningFireUntil)
+                    UpdateDirectFire(bot, state, targetChest.position, targetDirection);
+                else
+                    UpdateEftCoverCombat(bot, botPlayer, state, eye, targetChest, targetHead);
+                return true;
+            }
+
+            float now = Time.unscaledTime;
+            if (now < state.NextVisionCheck)
+                return false;
+            state.NextVisionCheck = now + VisionInterval +
+                (botPlayer.GetInstanceID() & 3) * 0.007f;
+
+            bool inFov = IsInsideVisionField(bot.LookDirection, targetDirection);
+            bool visible = inFov &&
+                (IsVisionRayClear(botPlayer, state, eye.position, targetChest.position) ||
+                 (targetHead != null &&
+                  IsVisionRayClear(botPlayer, state, eye.position, targetHead.position)));
+            state.VisionVisibleSeconds = visible
+                ? state.VisionVisibleSeconds + VisionInterval
+                : 0f;
+            if (state.VisionVisibleSeconds >= VisionConfirmSeconds)
+            {
+                state.PlayerConfirmed = true;
+                state.LastKnownPlayerPosition = targetChest.position;
+                state.LastSeenPlayerTime = Time.unscaledTime;
+                state.HasCurrentVisual = true;
+                state.OpeningFireUntil = Time.unscaledTime + 0.75f;
+                state.CoverCommitted = false;
+                state.AtCover = false;
+                state.VisibleWanderActive = false;
+                state.HasQueuedVisibleDestination = false;
+                ClearWanderPath(state);
+                state.VisionStoppedMovement = false;
+                return true;
+            }
+            return false;
+        }
+
+        private bool IsInCombat(Player player)
+        {
+            return _disableAi.Value && _simpleHiddenWander.Value &&
+                   IsAlive(player) &&
+                   _bodyStates.TryGetValue(player, out BodyAnimatorState state) &&
+                   state.PlayerConfirmed;
+        }
+
+        private void UpdateDirectFire(
+            BotOwner bot,
+            BodyAnimatorState state,
+            Vector3 target,
+            Vector3 direction)
+        {
+            if (!state.AtCover &&
+                (state.CombatCoverActive || !state.VisionStoppedMovement))
+            {
+                bot.Mover?.Stop();
+                SetTravelMovement(bot, sprint: false);
+                state.CombatCoverActive = false;
+                state.VisionStoppedMovement = true;
+            }
+            bot.Steering?.LookToDirection(direction.normalized);
+            IBotAiming aiming = bot.AimingManager?.CurrentAiming;
+            aiming?.SetTarget(target);
+            // Aim completion is advanced by NodeUpdate, not ManualUpdate.
+            bot.AimingManager?.NodeUpdate();
+            if (bot.ShootData != null)
+                bot.ShootData.SetCanShootByState(true);
+            bool fired = aiming != null && aiming.IsReady &&
+                         bot.ShootData != null && bot.ShootData.Shoot();
+            if (!fired && Time.unscaledTime >= state.NextCombatDiagnostic)
+            {
+                state.NextCombatDiagnostic = Time.unscaledTime + 2f;
+                Logger.LogInfo(
+                    "Combat waiting: aimReady=" + (aiming != null && aiming.IsReady) +
+                    " weaponReady=" + (bot.WeaponManager != null && bot.WeaponManager.IsWeaponReady) +
+                    " bullets=" + (bot.WeaponManager != null && bot.WeaponManager.HaveBullets) +
+                    " canShootState=" + (bot.ShootData != null && bot.ShootData.CanShootByState) +
+                    " controller=" + (bot.WeaponManager?.ShootController != null));
+            }
+        }
+
+        private void UpdateEftCoverCombat(
+            BotOwner bot,
+            Player botPlayer,
+            BodyAnimatorState state,
+            Transform eye,
+            Transform targetChest,
+            Transform targetHead)
+        {
+            if (!state.CoverCommitted)
+            {
+                bot.ShootData?.EndShoot();
+                if (!TrySelectCombatCover(
+                        bot,
+                        state,
+                        out CustomNavigationPoint cover,
+                        out Vector3 coverPosition))
+                {
+                    UpdateNoCoverFallback(bot, state, eye.position);
+                    return;
+                }
+                ReleaseCombatCover(state);
+                state.CombatCoverPoint = cover;
+                state.CombatCoverPosition = coverPosition;
+                cover?.SetOwner(bot);
+                bot.Mover.Stop();
+                bot.Mover.MovementResume();
+                SetTravelMovement(bot, sprint: NeedsCombatReload(bot));
+                NavMeshPathStatus status = bot.GoToPoint(
+                    coverPosition,
+                    slowAtTheEnd: true,
+                    reachDist: 0.65f,
+                    getUpWithCheck: false,
+                    mustHaveWay: true,
+                    mustGetUp: true,
+                    onlyShortTrie: false,
+                    force: true);
+                state.CoverCommitted = status == NavMeshPathStatus.PathComplete;
+                state.CombatCoverActive = state.CoverCommitted;
+                state.AtCover = false;
+                state.MovingToPeek = false;
+                return;
+            }
+
+            CustomNavigationPoint point = state.CombatCoverPoint;
+            if (!state.AtCover)
+            {
+                if (NeedsCombatReload(bot))
+                {
+                    bot.ShootData?.EndShoot();
+                    SetTravelMovement(bot, sprint: true);
+                }
+                if (bot.Mover.HasPathAndNoComplete &&
+                    (state.MovingToPeek ||
+                     (state.CombatCoverPosition - botPlayer.Position).sqrMagnitude > 1.44f))
+                {
+                    bool movingShotClear =
+                        IsVisionRayClear(botPlayer, state, eye.position, targetChest.position) ||
+                        (targetHead != null &&
+                         IsVisionRayClear(botPlayer, state, eye.position, targetHead.position));
+                    if (movingShotClear)
+                    {
+                        state.LastKnownPlayerPosition = targetChest.position;
+                        UpdateMovingFire(bot, targetChest.position);
+                    }
+                    else
+                    {
+                        bot.ShootData?.EndShoot();
+                    }
+                    return;
+                }
+                bot.Mover.Stop();
+                state.AtCover = true;
+                state.MovingToPeek = false;
+                state.VisionStoppedMovement = true;
+                SetTravelMovement(bot, sprint: false);
+                bot.SetPose(point != null && point.CoverLevel == CoverLevel.Sit ? 0f : 1f);
+                state.NextPeek = 0f;
+            }
+
+            if (NeedsCombatReload(bot))
+            {
+                bot.ShootData?.EndShoot();
+                bot.GetPlayer.MovementContext.SetTilt(0f);
+                bot.WeaponManager?.Reload?.TryReload();
+                return;
+            }
+
+            Vector3 memoryDirection = state.LastKnownPlayerPosition - eye.position;
+            bot.Steering?.LookToDirection(memoryDirection.normalized);
+            if (Time.unscaledTime >= state.NextPeek)
+            {
+                state.NextPeek = Time.unscaledTime + 1.2f;
+                if (point != null && (point.CanLookLeft || point.CanLookRight))
+                    bot.GetPlayer.MovementContext.SetTilt(
+                        point.TiltType == BotTiltType.left ? -5f : 5f);
+            }
+
+            bool clearShot =
+                IsVisionRayClear(botPlayer, state, eye.position, targetChest.position) ||
+                (targetHead != null &&
+                 IsVisionRayClear(botPlayer, state, eye.position, targetHead.position));
+            if (clearShot)
+            {
+                state.LastKnownPlayerPosition = targetChest.position;
+                state.LastSeenPlayerTime = Time.unscaledTime;
+                state.HasCurrentVisual = true;
+                UpdateDirectFire(bot, state, targetChest.position, targetChest.position - eye.position);
+                // Direct fire stops movement but must not discard our cover.
+                state.CombatCoverActive = true;
+                state.CoverCommitted = true;
+                state.AtCover = true;
+            }
+            else
+            {
+                bot.ShootData?.EndShoot();
+                bot.AimingManager?.CurrentAiming?.SetTarget(state.LastKnownPlayerPosition);
+                TryStartStrafeReacquire(bot, state, eye.position);
+            }
+        }
+
+        private static bool NeedsCombatReload(BotOwner bot)
+        {
+            return bot?.WeaponManager?.Reload != null &&
+                   (bot.WeaponManager.Reload.Reloading ||
+                    bot.WeaponManager.Reload.BulletCount <= 0);
+        }
+
+        private void UpdateNoCoverFallback(
+            BotOwner bot,
+            BodyAnimatorState state,
+            Vector3 eyePosition)
+        {
+            bot.Mover?.Stop();
+            SetTravelMovement(bot, sprint: false);
+            bot.SetPose(0f);
+            if (Time.unscaledTime >= state.NextPeek)
+            {
+                state.NextPeek = Time.unscaledTime + 1.2f;
+                bot.GetPlayer.MovementContext.SetTilt(state.PeekLeft ? -5f : 5f);
+                state.PeekLeft = !state.PeekLeft;
+            }
+            Vector3 direction = state.LastKnownPlayerPosition - eyePosition;
+            bot.Steering?.LookToDirection(direction.normalized);
+            bot.AimingManager?.CurrentAiming?.SetTarget(state.LastKnownPlayerPosition);
+            bot.AimingManager?.NodeUpdate();
+            if (NeedsCombatReload(bot))
+            {
+                bot.ShootData?.EndShoot();
+                bot.WeaponManager?.Reload?.TryReload();
+            }
+            else if (state.HasCurrentVisual &&
+                     bot.AimingManager?.CurrentAiming != null &&
+                     bot.AimingManager.CurrentAiming.IsReady)
+            {
+                bot.ShootData?.SetCanShootByState(true);
+                bot.ShootData?.Shoot();
+            }
+        }
+
+        private void TryStartStrafeReacquire(
+            BotOwner bot,
+            BodyAnimatorState state,
+            Vector3 eyePosition)
+        {
+            if (Time.unscaledTime < state.NextStrafeSearch || bot.Mover == null)
+                return;
+            state.NextStrafeSearch = Time.unscaledTime + 1.5f;
+            if (!_bodyStates.TryGetValue(bot.GetPlayer, out BodyAnimatorState botState))
+                return;
+
+            Vector3 toward = state.LastKnownPlayerPosition - eyePosition;
+            toward.y = 0f;
+            if (toward.sqrMagnitude < 0.01f)
+                return;
+            toward.Normalize();
+
+            Vector3 selected = Vector3.zero;
+            float bestPath = float.MaxValue;
+            if (state.CombatCoverPoint != null && state.CombatCoverPoint.HaveAltPosition)
+                EvaluatePeekCandidate(
+                    bot,
+                    botState,
+                    state.CombatCoverPoint.AltPosition,
+                    eyePosition,
+                    state.LastKnownPlayerPosition,
+                    ref selected,
+                    ref bestPath);
+
+            float[] angles = { -80f, -55f, -30f, 30f, 55f, 80f };
+            for (int i = 0; i < angles.Length; i++)
+            {
+                Vector3 direction = Quaternion.Euler(0f, angles[i], 0f) * toward;
+                Vector3 candidate = bot.Position + direction * 3f;
+                EvaluatePeekCandidate(
+                    bot,
+                    botState,
+                    candidate,
+                    eyePosition,
+                    state.LastKnownPlayerPosition,
+                    ref selected,
+                    ref bestPath);
+            }
+            if (bestPath == float.MaxValue)
+                return;
+
+            bot.Mover.Stop();
+            bot.Mover.MovementResume();
+            SetTravelMovement(bot, sprint: false);
+            NavMeshPathStatus status = bot.GoToPoint(
+                selected,
+                slowAtTheEnd: true,
+                reachDist: 0.35f,
+                getUpWithCheck: false,
+                mustHaveWay: true,
+                mustGetUp: true,
+                onlyShortTrie: true,
+                force: true);
+            if (status == NavMeshPathStatus.PathComplete)
+            {
+                state.AtCover = false;
+                state.VisionStoppedMovement = false;
+                state.MovingToPeek = true;
+            }
+        }
+
+        private void EvaluatePeekCandidate(
+            BotOwner bot,
+            BodyAnimatorState botState,
+            Vector3 candidate,
+            Vector3 currentEye,
+            Vector3 lastKnownTarget,
+            ref Vector3 selected,
+            ref float bestPath)
+        {
+            if (!NavMesh.SamplePosition(candidate, out NavMeshHit hit, 1.5f, NavMesh.AllAreas) ||
+                NavMesh.Raycast(bot.Position, hit.position, out NavMeshHit _, NavMesh.AllAreas) ||
+                !TryCalculatePath(bot.Position, hit.position, out Vector3[] corners))
+                return;
+            float pathDistance = PathDistance(corners);
+            if (pathDistance > 8f || pathDistance >= bestPath)
+                return;
+
+            Vector3 predictedEye = hit.position + Vector3.up *
+                Mathf.Clamp(currentEye.y - bot.Position.y, 1.1f, 1.8f);
+            if (!IsVisionRayClear(
+                    bot.GetPlayer,
+                    botState,
+                    predictedEye,
+                    lastKnownTarget))
+                return;
+            selected = hit.position;
+            bestPath = pathDistance;
+        }
+
+        private void UpdateMovingFire(BotOwner bot, Vector3 target)
+        {
+            IBotAiming aiming = bot.AimingManager?.CurrentAiming;
+            aiming?.SetTarget(target);
+            bot.AimingManager?.NodeUpdate();
+            bot.ShootData?.SetCanShootByState(true);
+            if (aiming != null && aiming.IsReady)
+                bot.ShootData?.Shoot();
+        }
+
+        private bool TrySelectCombatCover(
+            BotOwner bot,
+            BodyAnimatorState state,
+            out CustomNavigationPoint selected,
+            out Vector3 selectedPosition)
+        {
+            selected = null;
+            selectedPosition = Vector3.zero;
+            float best = float.MaxValue;
+            Vector3 observer = _camera != null
+                ? _camera.transform.position
+                : _mainPlayer.PlayerBones.Head.Original.position;
+            List<CustomNavigationPoint> points = bot.Covers != null
+                ? bot.Covers.GetClosePoints(bot.Position, 80f)
+                : null;
+            if (points != null)
+            {
+                foreach (CustomNavigationPoint point in points)
+                {
+                    if (point == null || !point.IsFreeById(bot.Id) || point.IsSpotted ||
+                        !IsPointOccludedFromPlayer(observer, point.Position + Vector3.up) ||
+                        !TryCalculatePath(bot.Position, point.Position, out Vector3[] corners))
+                        continue;
+                    float distance = PathDistance(corners);
+                    if (distance < best)
+                    {
+                        best = distance;
+                        selected = point;
+                        selectedPosition = point.Position;
+                    }
+                }
+            }
+            if (selected != null)
+                return true;
+
+            CustomNavigationPoint graphPoint = bot.Covers?.FindHidePoint(bot.Position, -1f);
+            if (graphPoint != null && graphPoint.IsFreeById(bot.Id) &&
+                TryCalculatePath(bot.Position, graphPoint.Position, out Vector3[] graphCorners))
+            {
+                selected = graphPoint;
+                selectedPosition = graphPoint.Position;
+                return true;
+            }
+
+            // Maps/areas without authored cover still get a cheap reachable
+            // point that our actual reverse visibility ray verifies as hidden.
+            for (int ring = 0; ring < 2; ring++)
+            {
+                float radius = ring == 0 ? 10f : 20f;
+                for (int i = 0; i < 12; i++)
+                {
+                    Vector3 direction = Quaternion.Euler(0f, i * 30f, 0f) * Vector3.forward;
+                    Vector3 candidate = bot.Position + direction * radius;
+                    if (!NavMesh.SamplePosition(candidate, out NavMeshHit hit, 4f, NavMesh.AllAreas) ||
+                        !IsPointOccludedFromPlayer(observer, hit.position + Vector3.up * 1.2f) ||
+                        !TryCalculatePath(bot.Position, hit.position, out Vector3[] fallbackCorners))
+                        continue;
+                    float distance = PathDistance(fallbackCorners);
+                    if (distance < best)
+                    {
+                        best = distance;
+                        selectedPosition = hit.position;
+                    }
+                }
+            }
+            if (best < float.MaxValue)
+                return true;
+
+            Logger.LogInfo(
+                "Combat cover search failed: authored=" + (points?.Count ?? 0) +
+                " bot=" + bot.Id);
+            return false;
+        }
+
+        private static void ReleaseCombatCover(BodyAnimatorState state)
+        {
+            state.CombatCoverPoint?.SetFree();
+            state.CombatCoverPoint = null;
+            state.CombatCoverPosition = Vector3.zero;
+            state.CoverCommitted = false;
+            state.AtCover = false;
+            state.MovingToPeek = false;
+        }
+
+        private bool IsPointOccludedFromPlayer(Vector3 origin, Vector3 point)
+        {
+            Vector3 delta = point - origin;
+            float distance = delta.magnitude;
+            if (distance <= 0.1f)
+                return false;
+            int count = Physics.RaycastNonAlloc(
+                origin,
+                delta / distance,
+                _visibilityHits,
+                distance,
+                VisibilityMask,
+                QueryTriggerInteraction.Ignore);
+            float closest = float.MaxValue;
+            for (int i = 0; i < count; i++)
+            {
+                Collider collider = _visibilityHits[i].collider;
+                if (collider == null)
+                    continue;
+                int id = collider.GetInstanceID();
+                if (_localPlayerColliderIds.Contains(id) ||
+                    IsPlayerCollider(collider, _mainPlayer) ||
+                    IsAnyPlayerCollider(collider) ||
+                    IsTransparentCollider(collider, id))
+                    continue;
+                closest = Mathf.Min(closest, _visibilityHits[i].distance);
+            }
+            return closest < distance - 0.25f;
+        }
+
+        private static float PathDistance(Vector3[] corners)
+        {
+            float distance = 0f;
+            for (int i = 1; i < corners.Length; i++)
+                distance += Vector3.Distance(corners[i - 1], corners[i]);
+            return distance;
+        }
+
+        private static void ForgetCombatTarget(BotOwner bot, BodyAnimatorState state)
+        {
+            bot.ShootData?.EndShoot();
+            bot.AimingManager?.CurrentAiming?.LoseTarget();
+            bot.Mover?.Stop();
+            state.PlayerConfirmed = false;
+            state.VisionVisibleSeconds = 0f;
+            state.VisionStoppedMovement = false;
+            state.CombatCoverActive = false;
+            state.NextCoverSearch = 0f;
+            state.NextCombatDiagnostic = 0f;
+            state.HasCurrentVisual = false;
+            state.LastSeenPlayerTime = 0f;
+            state.NextStrafeSearch = 0f;
+            state.MovingToPeek = false;
+            ReleaseCombatCover(state);
+            state.VisibleWanderActive = false;
+            state.HasQueuedVisibleDestination = false;
+            ClearWanderPath(state);
+        }
+
+        private static bool IsInsideVisionField(Vector3 look, Vector3 toTarget)
+        {
+            float distance = toTarget.magnitude;
+            if (distance < 0.01f)
+                return false;
+            Vector3 flatLook = new Vector3(look.x, 0f, look.z);
+            Vector3 flatTarget = new Vector3(toTarget.x, 0f, toTarget.z);
+            if (flatLook.sqrMagnitude < 0.01f || flatTarget.sqrMagnitude < 0.01f)
+                return false;
+            float horizontalAngle = Vector3.Angle(flatLook, flatTarget);
+            const float halfFov = 95f;
+            if (horizontalAngle > halfFov)
+                return false;
+            float edge = Mathf.Pow(horizontalAngle / halfFov, 1.25f);
+            float allowedRange = Mathf.Lerp(VisionRange, 25f, edge);
+            if (distance > allowedRange)
+                return false;
+            float verticalAngle = Mathf.Abs(Mathf.Atan2(
+                toTarget.y,
+                flatTarget.magnitude) * Mathf.Rad2Deg);
+            return verticalAngle <= 40f;
+        }
+
+        private bool IsVisionRayClear(
+            Player botPlayer,
+            BodyAnimatorState botState,
+            Vector3 origin,
+            Vector3 target)
+        {
+            Vector3 delta = target - origin;
+            float distance = delta.magnitude;
+            if (distance <= 0.05f)
+                return true;
+            int hitCount = Physics.RaycastNonAlloc(
+                origin,
+                delta / distance,
+                _visibilityHits,
+                distance + 0.05f,
+                VisibilityMask,
+                QueryTriggerInteraction.Ignore);
+            if (hitCount == 0)
+                return true;
+
+            float closest = float.MaxValue;
+            bool closestIsTarget = false;
+            for (int i = 0; i < hitCount; i++)
+            {
+                Collider collider = _visibilityHits[i].collider;
+                if (collider == null)
+                    continue;
+                int id = collider.GetInstanceID();
+                if (botState.ColliderIds.Contains(id) ||
+                    IsPlayerCollider(collider, botPlayer) ||
+                    IsTransparentCollider(collider, id))
+                    continue;
+                float hitDistance = _visibilityHits[i].distance;
+                if (hitDistance >= closest)
+                    continue;
+                bool isTarget = _localPlayerColliderIds.Contains(id) ||
+                                IsPlayerCollider(collider, _mainPlayer);
+                if (!isTarget && IsAnyPlayerCollider(collider))
+                    continue;
+                closest = hitDistance;
+                closestIsTarget = isTarget;
+            }
+            return closest == float.MaxValue || closestIsTarget ||
+                   closest >= distance - 0.05f;
+        }
+
+        private void UpdateSimpleWander(BotOwner bot)
+        {
+            Player player = bot != null ? bot.GetPlayer : null;
+            BodyAnimatorState state = null;
+            if (player != null)
+                _bodyStates.TryGetValue(player, out state);
+            if (player == null || player.IsYourPlayer ||
+                !_simpleHiddenWander.Value || !_disableAi.Value ||
+                !IsAlive(player) ||
+                state == null || bot.Mover == null)
+            {
+                if (state != null)
+                    EndCustomWander(bot, player, state);
+                return;
+            }
+
+            if (TryPickupReachedLoot(bot, player, state))
+                return;
+
+            Player groupLeader = state.GroupLeader;
+            float groupSeparationSqr = groupLeader != null
+                ? (groupLeader.Position - player.Position).sqrMagnitude
+                : 0f;
+            if (groupLeader != null && groupLeader != player && IsAlive(groupLeader) &&
+                groupSeparationSqr > 75f * 75f &&
+                Time.unscaledTime >= state.NextEmergencyRegroup)
+            {
+                state.NextEmergencyRegroup = Time.unscaledTime + 1f;
+                bot.Mover.Stop();
+                state.VisibleWanderActive = false;
+                state.HasQueuedVisibleDestination = false;
+                ClearWanderPath(state);
+
+            }
+            else if (groupLeader != null && groupLeader != player && IsAlive(groupLeader) &&
+                groupSeparationSqr > 20f * 20f &&
+                Time.unscaledTime >= state.NextFormationCorrection)
+            {
+                state.NextFormationCorrection = Time.unscaledTime + 3f;
+                bot.Mover.Stop();
+                state.VisibleWanderActive = false;
+                state.HasQueuedVisibleDestination = false;
+                ClearWanderPath(state);
+            }
+
+            // Groups always remain on EFT path movement, even while culled.
+            // Only solo hidden bots use the virtual teleport tier.
+            if (groupLeader != null && IsAlive(groupLeader))
+            {
+                if (state.WasWandering)
+                    EndHiddenWander(bot, player, state);
+                UpdateVisibleWander(bot, player, state);
+                return;
+            }
+
+            if (!IsCulledAndHidden(player))
+            {
+                if (state.WasWandering)
+                    EndHiddenWander(bot, player, state);
+                UpdateVisibleWander(bot, player, state);
+                return;
+            }
+
+            if (state.VisibleWanderActive)
+            {
+                bot.Mover.Stop();
+                state.VisibleWanderActive = false;
+                state.NextVisibleWanderUpdate = 0f;
+            }
+
+            float now = Time.unscaledTime;
+            if (!state.WasWandering)
+            {
+                // Discard the native path at takeover. BotMover.Teleport below
+                // then keeps EFT's internal PositionOnWay synchronized with the
+                // physical Player position.
+                bot.Mover.Stop();
+                state.WasWandering = true;
+            }
+            if (state.NextWanderUpdate <= 0f)
+            {
+                state.NextWanderUpdate = now + WanderIntervalSeconds +
+                    (player.GetInstanceID() & 7) * 0.11f;
+                return;
+            }
+            if (now < state.NextWanderUpdate)
+                return;
+            state.NextWanderUpdate = now + WanderIntervalSeconds;
+
+            if (!HasUsableWanderPath(state) && !TryCreateTaskPath(player, state))
+                return;
+
+            Vector3 position = player.Position;
+            float remaining = state.AppliedResting ? 1f : WanderStepDistance;
+            while (remaining > 0f && HasUsableWanderPath(state))
+            {
+                Vector3 corner = state.WanderCorners[state.WanderCorner];
+                Vector3 delta = corner - position;
+                float distance = delta.magnitude;
+                if (distance <= 0.1f)
+                {
+                    state.WanderCorner++;
+                    continue;
+                }
+                if (distance <= remaining)
+                {
+                    position = corner;
+                    remaining -= distance;
+                    state.WanderCorner++;
+                }
+                else
+                {
+                    position += delta / distance * remaining;
+                    remaining = 0f;
+                }
+            }
+
+            if (NavMesh.SamplePosition(position, out NavMeshHit hit, 0.75f, NavMesh.AllAreas))
+                bot.Mover.Teleport(hit.position);
+            if (!HasUsableWanderPath(state))
+                ClearWanderPath(state);
+        }
+
+        private void UpdateVisibleWander(
+            BotOwner bot,
+            Player player,
+            BodyAnimatorState state)
+        {
+            float now = Time.unscaledTime;
+            if (now < state.NextVisibleWanderUpdate)
+                return;
+            state.NextVisibleWanderUpdate = now + 0.1f;
+
+            if (!state.VisibleWanderActive || !bot.Mover.HasPathAndNoComplete)
+            {
+                Vector3 destination;
+                if (state.HasQueuedVisibleDestination)
+                {
+                    destination = state.QueuedVisibleDestination;
+                    state.HasQueuedVisibleDestination = false;
+                }
+                else if (!TryCreateVisibleTaskPath(player, state, out Vector3[] corners))
+                {
+                    state.NextVisibleWanderUpdate = now + 2f;
+                    return;
+                }
+                else
+                {
+                    destination = corners[corners.Length - 1];
+                }
+                StartVisibleRoute(bot, state, destination, now, false);
+                return;
+            }
+
+            float remaining = bot.Mover.DistDestination;
+            if (remaining <= 7f && !state.HasQueuedVisibleDestination && state.LootTarget == null)
+            {
+                Vector3 forward = state.VisibleDestination - player.Position;
+                if (TryFindWanderPath(player, forward, out Vector3[] nextCorners))
+                {
+                    state.QueuedVisibleDestination = nextCorners[nextCorners.Length - 1];
+                    state.HasQueuedVisibleDestination = true;
+                }
+            }
+
+            if (remaining <= 6f && !state.VisibleWanderSlowing)
+            {
+                state.VisibleWanderSlowing = true;
+                SetTravelMovement(bot, sprint: false);
+            }
+
+            // Swap routes before the old one completes. EFT therefore keeps a
+            // moving locomotion state rather than stopping, idling and swiveling.
+            if (remaining <= 1.75f && state.HasQueuedVisibleDestination && state.LootTarget == null)
+            {
+                Vector3 next = state.QueuedVisibleDestination;
+                state.HasQueuedVisibleDestination = false;
+                StartVisibleRoute(bot, state, next, now, true);
+                return;
+            }
+
+            if (!state.VisibleWanderSlowing && now >= state.ResumeSprintAt)
+            {
+                SetTravelMovement(bot, sprint: !state.AppliedResting);
+            }
+        }
+
+        private static void StartVisibleRoute(
+            BotOwner bot,
+            BodyAnimatorState state,
+            Vector3 destination,
+            float now,
+            bool rollingHandoff)
+        {
+            if (!rollingHandoff)
+                bot.Mover.Stop();
+            bot.Mover.MovementResume();
+            SetTravelMovement(
+                bot,
+                sprint: !state.AppliedResting && !rollingHandoff);
+            NavMeshPathStatus status = bot.GoToPoint(
+                destination,
+                slowAtTheEnd: false,
+                reachDist: 0.75f,
+                getUpWithCheck: false,
+                mustHaveWay: true,
+                mustGetUp: true,
+                onlyShortTrie: false,
+                force: true);
+            state.VisibleWanderActive = status == NavMeshPathStatus.PathComplete;
+            state.VisibleDestination = destination;
+            state.VisibleWanderSlowing = rollingHandoff;
+            state.ResumeSprintAt = rollingHandoff ? now + 0.8f : now;
+            if (rollingHandoff)
+                state.VisibleWanderSlowing = false;
+        }
+
+        private void EndCustomWander(
+            BotOwner bot,
+            Player player,
+            BodyAnimatorState state)
+        {
+            if (state.WasWandering)
+                EndHiddenWander(bot, player, state);
+            if (state.VisibleWanderActive && bot != null && bot.Mover != null)
+                bot.Mover.Stop();
+            state.VisibleWanderActive = false;
+            state.NextVisibleWanderUpdate = 0f;
+            state.HasQueuedVisibleDestination = false;
+            state.VisibleWanderSlowing = false;
+            state.ResumeSprintAt = 0f;
+            ReleaseLootReservation(state);
+        }
+
+        private static void EndHiddenWander(
+            BotOwner bot,
+            Player player,
+            BodyAnimatorState state)
+        {
+            if (bot != null && bot.Mover != null)
+            {
+                // Clear any remaining native/custom route and stamp the final
+                // physical location into BotMover before its next native tick.
+                bot.Mover.Stop();
+                if (player != null)
+                    bot.Mover.Teleport(player.Position);
+            }
+            state.WasWandering = false;
+            ClearWanderPath(state);
+        }
+
+        private static bool HasUsableWanderPath(BodyAnimatorState state)
+        {
+            return state.WanderCorners != null &&
+                   state.WanderCorner < state.WanderCorners.Length;
+        }
+
+        private bool TryCreateTaskPath(Player player, BodyAnimatorState state)
+        {
+            if (!TryCreateVisibleTaskPath(player, state, out Vector3[] corners))
+                return false;
+            state.WanderCorners = corners;
+            state.WanderCorner = 1;
+            return true;
+        }
+
+        private bool TryCreateVisibleTaskPath(
+            Player player,
+            BodyAnimatorState state,
+            out Vector3[] corners)
+        {
+            if (TryGetRestPath(player, state, out corners))
+                return true;
+            if (state.GroupLeader != null && state.GroupLeader != player &&
+                IsAlive(state.GroupLeader))
+            {
+                if (Time.unscaledTime < state.NextFollowerRouteCommand)
+                {
+                    corners = null;
+                    return false;
+                }
+                state.NextFollowerRouteCommand = Time.unscaledTime +
+                    UnityEngine.Random.Range(1.5f, 3f);
+                // A follower never falls through into an independent loot or
+                // random task merely because this formation path failed.
+                return TryGetGroupPath(player, state, out corners);
+            }
+            if (TryGetLootPath(player, state, out corners))
+                return true;
+            return TryFindWanderPath(player, Vector3.zero, out corners);
+        }
+
+        private bool TryGetRestPath(
+            Player player,
+            BodyAnimatorState state,
+            out Vector3[] corners)
+        {
+            corners = null;
+            if (!state.AppliedResting)
+                return false;
+
+            Player anchor = state.RestAnchor;
+            if (state.GroupLeader != null &&
+                _bodyStates.TryGetValue(state.GroupLeader, out BodyAnimatorState leaderState) &&
+                leaderState.RestAnchor != null)
+                anchor = leaderState.RestAnchor;
+            Vector3 center = anchor != null ? anchor.Position : player.Position;
+            Vector2 offset = UnityEngine.Random.insideUnitCircle.normalized *
+                             UnityEngine.Random.Range(3f, 8f);
+            Vector3 candidate = center + new Vector3(offset.x, 0f, offset.y);
+            if (!NavMesh.SamplePosition(candidate, out NavMeshHit hit, 6f, NavMesh.AllAreas))
+                return false;
+            return TryCalculatePath(player.Position, hit.position, out corners);
+        }
+
+        private bool TryGetGroupPath(
+            Player player,
+            BodyAnimatorState state,
+            out Vector3[] corners)
+        {
+            corners = null;
+            Player leader = state.GroupLeader;
+            if (leader == null || leader == player || !IsAlive(leader))
+                return false;
+
+            Vector3 center = leader.Position;
+            if (_bodyStates.TryGetValue(leader, out BodyAnimatorState leaderState))
+            {
+                Vector3 leaderGoal = leader.Position;
+                bool hasGoal = false;
+                if (leaderState.LootTarget != null)
+                {
+                    leaderGoal = leaderState.LootApproachPosition;
+                    hasGoal = true;
+                }
+                else if (leaderState.VisibleWanderActive)
+                {
+                    leaderGoal = leaderState.VisibleDestination;
+                    hasGoal = true;
+                }
+                if (hasGoal)
+                {
+                    Vector3 direction = leaderGoal - leader.Position;
+                    direction.y = 0f;
+                    float distance = direction.magnitude;
+                    if (distance > 0.1f)
+                        center = leader.Position + direction / distance * Mathf.Min(30f, distance);
+                }
+            }
+            EnsureFormationOffset(state);
+            Vector3 candidate = center + state.FormationOffset;
+            if (!NavMesh.SamplePosition(candidate, out NavMeshHit hit, 8f, NavMesh.AllAreas))
+                return false;
+            return TryCalculatePath(player.Position, hit.position, out corners);
+        }
+
+        private bool TryGetLootPath(
+            Player player,
+            BodyAnimatorState state,
+            out Vector3[] corners)
+        {
+            corners = null;
+            if (IsLootTargetValid(state, player))
+                return TryCalculatePath(player.Position, state.LootApproachPosition, out corners);
+
+            ReleaseLootReservation(state);
+            if (_looseLoot.Count == 0)
+                return false;
+
+            int start = Mathf.Abs(player.GetInstanceID()) % _looseLoot.Count;
+            int pathAttempts = 0;
+            for (int offset = 0; offset < _looseLoot.Count && pathAttempts < 24; offset++)
+            {
+                LootItem loot = _looseLoot[(start + offset) % _looseLoot.Count];
+                if (!IsAvailableLoot(loot, player))
+                    continue;
+                float distance = Vector3.Distance(player.Position, loot.transform.position);
+                if (distance < 10f || distance > 500f)
+                    continue;
+                pathAttempts++;
+                if (!NavMesh.SamplePosition(
+                        loot.transform.position,
+                        out NavMeshHit approach,
+                        1.5f,
+                        NavMesh.AllAreas) ||
+                    !TryCalculatePath(player.Position, approach.position, out corners))
+                    continue;
+
+                state.LootTarget = loot;
+                state.LootApproachPosition = approach.position;
+                state.ReservedLootId = loot.GetInstanceID();
+                _lootReservations[state.ReservedLootId] = player;
+                return true;
+            }
+            return false;
+        }
+
+        private static bool TryCalculatePath(
+            Vector3 from,
+            Vector3 to,
+            out Vector3[] corners)
+        {
+            corners = null;
+            NavMeshPath path = new NavMeshPath();
+            if (!NavMesh.CalculatePath(from, to, NavMesh.AllAreas, path) ||
+                path.status != NavMeshPathStatus.PathComplete || path.corners.Length < 2)
+                return false;
+            corners = path.corners;
+            return true;
+        }
+
+        private bool TryPickupReachedLoot(
+            BotOwner bot,
+            Player player,
+            BodyAnimatorState state)
+        {
+            if (!IsLootTargetValid(state, player))
+            {
+                if (state.LootTarget != null || state.ReservedLootId != 0)
+                    ReleaseLootReservation(state);
+                return false;
+            }
+            Vector3 delta = state.LootTarget.transform.position - player.Position;
+            delta.y = 0f;
+            if (delta.sqrMagnitude > 2.7225f)
+                return false;
+
+            bot.Mover.Stop();
+            SetTravelMovement(bot, sprint: false);
+            LootItem loot = state.LootTarget;
+            if (bot.ItemTaker != null)
+            {
+                bot.ItemTaker.ItemToTake = loot;
+                GStruct154<GInterface424> placement =
+                    InteractionsHandlerClass.QuickFindAppropriatePlace(
+                        loot.Item,
+                        player.InventoryController,
+                        GClass1518.ToEnumerable(player.InventoryController.Inventory.Equipment),
+                        InteractionsHandlerClass.EMoveItemOrder.PickUp,
+                        simulate: true);
+                if (placement.Succeeded)
+                {
+                    bot.ItemTaker.method_1(
+                        player,
+                        placement.Value,
+                        loot.ItemOwner.RootItem,
+                        loot.LastOwner);
+                }
+            }
+            _looseLoot.Remove(loot);
+            ReleaseLootReservation(state);
+            state.VisibleWanderActive = false;
+            state.HasQueuedVisibleDestination = false;
+            ClearWanderPath(state);
+            state.NextWanderUpdate = Time.unscaledTime + 1.5f;
+            state.NextVisibleWanderUpdate = Time.unscaledTime + 1.5f;
+            return true;
+        }
+
+        private void AssignInitialGroup(BotOwner bot)
+        {
+            Player player = bot != null ? bot.GetPlayer : null;
+            if (player == null || !_bodyStates.TryGetValue(player, out BodyAnimatorState state) ||
+                state.DesiredGroupSize != 0)
+                return;
+
+            float roll = UnityEngine.Random.value;
+            // Requested distribution totals 85%; the remaining 15% is solo.
+            state.DesiredGroupSize = roll < 0.50f ? 1 :
+                                     roll < 0.75f ? 2 :
+                                     roll < 0.85f ? 3 : 1;
+            if (state.DesiredGroupSize > 1)
+            {
+                state.GroupLeader = player;
+                TryFillGroup(player, state);
+            }
+        }
+
+        private void MaintainSimpleGroup(BotOwner bot, Player player)
+        {
+            if (player == null || !_bodyStates.TryGetValue(player, out BodyAnimatorState state))
+                return;
+            if (state.DesiredGroupSize == 0)
+                AssignInitialGroup(bot);
+            if (state.GroupLeader != null && !IsAlive(state.GroupLeader))
+            {
+                state.GroupLeader = null;
+                state.DesiredGroupSize = 1;
+            }
+            if (state.GroupLeader != player || state.DesiredGroupSize <= 1 ||
+                Time.unscaledTime < state.NextGroupUpdate)
+                return;
+            state.NextGroupUpdate = Time.unscaledTime + 3f;
+            TryFillGroup(player, state);
+        }
+
+        private void UpdateStaminaPolicy(BotOwner bot, Player player)
+        {
+            if (player == null || !_bodyStates.TryGetValue(player, out BodyAnimatorState state))
+                return;
+
+            Player leader = state.GroupLeader;
+            BodyAnimatorState policyState = state;
+            if (leader != null && leader != player &&
+                _bodyStates.TryGetValue(leader, out BodyAnimatorState leaderState))
+            {
+                policyState = leaderState;
+            }
+            else
+            {
+                float lowest = GetStamina(player);
+                Player weakest = player;
+                if (state.GroupLeader == player)
+                {
+                    foreach (KeyValuePair<Player, BodyAnimatorState> pair in _bodyStates)
+                    {
+                        if (pair.Value.GroupLeader != player || !IsAlive(pair.Key))
+                            continue;
+                        float stamina = GetStamina(pair.Key);
+                        if (stamina < lowest)
+                        {
+                            lowest = stamina;
+                            weakest = pair.Key;
+                        }
+                    }
+                }
+                if (!policyState.GroupResting && lowest <= RestStartStamina)
+                    policyState.GroupResting = true;
+                else if (policyState.GroupResting && lowest >= RestEndStamina)
+                    policyState.GroupResting = false;
+                policyState.RestAnchor = policyState.GroupResting ? weakest : null;
+            }
+
+            bool resting = policyState.GroupResting;
+            state.RestAnchor = policyState.RestAnchor;
+            if (state.AppliedResting == resting)
+                return;
+            state.AppliedResting = resting;
+            if (bot != null && bot.Mover != null)
+            {
+                bot.Mover.Stop();
+                SetTravelMovement(bot, sprint: false);
+            }
+            state.VisibleWanderActive = false;
+            state.HasQueuedVisibleDestination = false;
+            ClearWanderPath(state);
+        }
+
+        private static float GetStamina(Player player)
+        {
+            if (player == null || player.Physical == null || player.Physical.Stamina == null)
+                return 1f;
+            return player.Physical.Stamina.NormalValue;
+        }
+
+        private static void SetTravelMovement(BotOwner bot, bool sprint)
+        {
+            if (bot == null || bot.Mover == null)
+                return;
+            // Standing is explicit for both modes so a bot inherited in crouch
+            // cannot remain stuck there after native brain updates are removed.
+            bot.SetPose(1f);
+            bot.Mover.SetTargetMoveSpeed(sprint ? 1f : 0.55f);
+            bot.Sprint(sprint, withDebugCallback: false);
+        }
+
+        private static void EnsureFormationOffset(BodyAnimatorState state)
+        {
+            if (state.HasFormationOffset)
+                return;
+            Vector2 offset = UnityEngine.Random.insideUnitCircle.normalized *
+                             UnityEngine.Random.Range(6f, 15f);
+            state.FormationOffset = new Vector3(offset.x, 0f, offset.y);
+            state.HasFormationOffset = true;
+        }
+
+        private void TryFillGroup(Player leader, BodyAnimatorState leaderState)
+        {
+            int count = 0;
+            foreach (BodyAnimatorState candidateState in _bodyStates.Values)
+            {
+                if (candidateState.GroupLeader == leader)
+                    count++;
+            }
+            while (count < leaderState.DesiredGroupSize)
+            {
+                Player closest = null;
+                float closestDistance = 100f * 100f;
+                foreach (BotOwner candidateBot in _bots)
+                {
+                    Player candidate = candidateBot != null ? candidateBot.GetPlayer : null;
+                    if (candidate == null || candidate == leader || !IsAlive(candidate) ||
+                        !_bodyStates.TryGetValue(candidate, out BodyAnimatorState candidateState) ||
+                        candidateState.GroupLeader != null)
+                        continue;
+                    float distance = (candidate.Position - leader.Position).sqrMagnitude;
+                    if (distance < closestDistance)
+                    {
+                        closestDistance = distance;
+                        closest = candidate;
+                    }
+                }
+                if (closest == null)
+                    break;
+                BodyAnimatorState followerState = _bodyStates[closest];
+                ReleaseLootReservation(followerState);
+                followerState.GroupLeader = leader;
+                followerState.DesiredGroupSize = 1;
+                followerState.HasFormationOffset = false;
+                followerState.NextFormationCorrection = Time.unscaledTime + 1f;
+                followerState.NextFollowerRouteCommand = Time.unscaledTime +
+                    UnityEngine.Random.Range(0.35f, 1.5f);
+                followerState.VisibleWanderActive = false;
+                followerState.HasQueuedVisibleDestination = false;
+                ClearWanderPath(followerState);
+                count++;
+            }
+        }
+
+        private bool IsAvailableLoot(LootItem loot, Player player)
+        {
+            if (loot == null || loot.Item == null || loot.ItemOwner == null ||
+                !loot.gameObject.activeInHierarchy)
+                return false;
+            int id = loot.GetInstanceID();
+            return !_lootReservations.TryGetValue(id, out Player owner) || owner == player;
+        }
+
+        private bool IsLootTargetValid(BodyAnimatorState state, Player player)
+        {
+            return state != null && state.LootTarget != null &&
+                   IsAvailableLoot(state.LootTarget, player) &&
+                   state.ReservedLootId == state.LootTarget.GetInstanceID();
+        }
+
+        private void ReleaseLootReservation(BodyAnimatorState state)
+        {
+            if (state == null)
+                return;
+            if (state.ReservedLootId != 0)
+                _lootReservations.Remove(state.ReservedLootId);
+            state.ReservedLootId = 0;
+            state.LootTarget = null;
+            state.LootApproachPosition = Vector3.zero;
+        }
+
+        private void RefreshLooseLoot()
+        {
+            if (_gameWorld == null || Time.unscaledTime < _nextLootRefresh)
+                return;
+            _nextLootRefresh = Time.unscaledTime + 10f;
+            _looseLoot.Clear();
+            foreach (IKillableLootItem killable in _gameWorld.LootList)
+            {
+                LootItem loot = killable as LootItem;
+                if (loot != null && loot.Item != null && loot.ItemOwner != null &&
+                    loot.gameObject.activeInHierarchy)
+                    _looseLoot.Add(loot);
+            }
+        }
+
+        private static bool TryFindWanderPath(Player player, out Vector3[] corners)
+        {
+            return TryFindWanderPath(player, Vector3.zero, out corners);
+        }
+
+        private static bool TryFindWanderPath(
+            Player player,
+            Vector3 preferredDirection,
+            out Vector3[] corners)
+        {
+            corners = null;
+            Vector2 direction;
+            preferredDirection.y = 0f;
+            if (preferredDirection.sqrMagnitude > 0.25f)
+            {
+                Vector3 turned = Quaternion.Euler(
+                    0f,
+                    UnityEngine.Random.Range(-55f, 55f),
+                    0f) * preferredDirection.normalized;
+                direction = new Vector2(turned.x, turned.z);
+            }
+            else
+            {
+                direction = UnityEngine.Random.insideUnitCircle.normalized;
+            }
+            float distance = UnityEngine.Random.Range(12f, 25f);
+            Vector3 candidate = player.Position +
+                new Vector3(direction.x, 0f, direction.y) * distance;
+            if (!NavMesh.SamplePosition(candidate, out NavMeshHit destination, 8f, NavMesh.AllAreas))
+                return false;
+
+            NavMeshPath path = new NavMeshPath();
+            if (!NavMesh.CalculatePath(player.Position, destination.position, NavMesh.AllAreas, path) ||
+                path.status != NavMeshPathStatus.PathComplete || path.corners.Length < 2)
+                return false;
+            corners = path.corners;
+            return true;
+        }
+
+        private static void ClearWanderPath(BodyAnimatorState state)
+        {
+            state.WanderCorners = null;
+            state.WanderCorner = 0;
+            state.NextWanderUpdate = 0f;
+        }
+
+        private void UpdateBodyAnimator(Player player, bool forceRefresh)
+        {
+            if (player == null || player.IsYourPlayer || player.PlayerBones == null)
+                return;
+
+            if (!IsAlive(player))
+            {
+                if (_bodyStates.TryGetValue(player, out BodyAnimatorState deadState))
+                {
+                    deadState.Animator = null;
+                    deadState.OriginalEnabled = false;
+                }
+                return;
+            }
+
+            if (!_bodyStates.TryGetValue(player, out BodyAnimatorState state))
+            {
+                state = new BodyAnimatorState();
+                _bodyStates.Add(player, state);
+                forceRefresh = true;
+            }
+
+            if (forceRefresh ||
+                state.Animator == null ||
+                Time.unscaledTime >= state.NextRefresh)
+            {
+                Animator current =
+                    player.PlayerBones.PlayableAnimator != null
+                        ? player.PlayerBones.PlayableAnimator.outputAnimator
+                        : null;
+                if (current != null && current != state.Animator)
+                {
+                    Restore(state);
+                    state.Animator = current;
+                    state.OriginalEnabled = current.enabled;
+                }
+                CacheVisibilityData(player, state);
+                state.NextRefresh = Time.unscaledTime + 1f;
+            }
+
+            if (state.Animator != null)
+            {
+                state.Animator.enabled =
+                    state.OriginalEnabled && !ShouldDisableBodyAnimator(player);
+            }
+        }
+
+        private void AttachMainPlayer(Player player)
+        {
+            _mainPlayer = player;
+            _localPlayerColliderIds.Clear();
+            _transparentColliderIds.Clear();
+            _opaqueColliderIds.Clear();
+            CacheColliderIds(player, _localPlayerColliderIds);
+        }
+
+        private void RefreshCamera()
+        {
+            if (_camera != null &&
+                _camera.enabled &&
+                _camera.gameObject.activeInHierarchy &&
+                _camera.targetTexture == null)
+                return;
+            if (Time.unscaledTime < _nextCameraRefresh)
+                return;
+
+            _nextCameraRefresh = Time.unscaledTime + 1f;
+            Camera best = null;
+            float bestScore = float.MinValue;
+            foreach (Camera candidate in Resources.FindObjectsOfTypeAll<Camera>())
+            {
+                if (candidate == null ||
+                    !candidate.enabled ||
+                    !candidate.gameObject.activeInHierarchy ||
+                    candidate.orthographic ||
+                    candidate.targetTexture != null)
+                    continue;
+                float score = candidate.depth;
+                if (candidate.CompareTag("MainCamera")) score += 500f;
+                if (candidate.name.IndexOf("FPS", StringComparison.OrdinalIgnoreCase) >= 0)
+                    score += 1000f;
+                if (score > bestScore)
+                {
+                    best = candidate;
+                    bestScore = score;
+                }
+            }
+            _camera = best != null ? best : Camera.main;
+        }
+
+        private void UpdateVisibility(Player player)
+        {
+            if (player == null || !IsAlive(player))
+                return;
+            if (!_bodyStates.TryGetValue(player, out BodyAnimatorState state))
+            {
+                state = new BodyAnimatorState();
+                _bodyStates.Add(player, state);
+                CacheVisibilityData(player, state);
+            }
+
+            float now = Time.unscaledTime;
+            bool eftVisible =
+                player.PlayerBody != null && player.IsVisible;
+            if (eftVisible)
+                state.ActiveUntil = now + VisibilityHoldSeconds;
+
+            if (_camera == null || now < state.NextVisibilityUpdate)
+            {
+                state.IsVisible =
+                    eftVisible || state.RayVisible || now < state.ActiveUntil;
+                return;
+            }
+
+            float distance = (player.Position - _camera.transform.position).magnitude;
+            float rate = distance <= 100f ? 10f : 4f;
+            state.NextVisibilityUpdate =
+                now + 1f / rate +
+                (player.GetInstanceID() & 3) * 0.001f;
+
+            if (!IsOnScreen(state.Head) && !IsOnScreen(state.Chest))
+            {
+                state.RayVisible = false;
+                state.IsVisible = eftVisible || now < state.ActiveUntil;
+                return;
+            }
+            state.RayVisible =
+                IsPointVisible(player, state, state.Head) ||
+                IsPointVisible(player, state, state.Chest);
+            if (state.RayVisible)
+                state.ActiveUntil = now + VisibilityHoldSeconds;
+            state.IsVisible =
+                eftVisible || state.RayVisible || now < state.ActiveUntil;
+        }
+
+        private bool IsOnScreen(Transform point)
+        {
+            if (point == null || _camera == null)
+                return false;
+            Vector3 viewport = _camera.WorldToViewportPoint(point.position);
+            return viewport.z > 0f &&
+                   viewport.x >= 0f && viewport.x <= 1f &&
+                   viewport.y >= 0f && viewport.y <= 1f;
+        }
+
+        private bool IsPointVisible(
+            Player target,
+            BodyAnimatorState state,
+            Transform point)
+        {
+            if (point == null || _camera == null)
+                return false;
+            Vector3 origin = _camera.transform.position;
+            Vector3 delta = point.position - origin;
+            float distance = delta.magnitude;
+            if (distance <= 0.05f)
+                return true;
+
+            int hitCount = Physics.RaycastNonAlloc(
+                origin,
+                delta / distance,
+                _visibilityHits,
+                distance + 0.05f,
+                VisibilityMask,
+                QueryTriggerInteraction.Ignore);
+            if (hitCount == 0)
+                return true;
+
+            float closest = float.MaxValue;
+            bool closestIsTarget = false;
+            for (int i = 0; i < hitCount; i++)
+            {
+                Collider collider = _visibilityHits[i].collider;
+                if (collider == null)
+                    continue;
+                int id = collider.GetInstanceID();
+                if (_localPlayerColliderIds.Contains(id) ||
+                    IsPlayerCollider(collider, _mainPlayer) ||
+                    IsTransparentCollider(collider, id))
+                    continue;
+                float hitDistance = _visibilityHits[i].distance;
+                if (hitDistance >= closest)
+                    continue;
+                bool belongs =
+                    state.ColliderIds.Contains(id) ||
+                    IsPlayerCollider(collider, target);
+                if (!belongs && IsAnyPlayerCollider(collider))
+                    continue;
+                closest = hitDistance;
+                closestIsTarget = belongs;
+            }
+            return closest == float.MaxValue ||
+                   closestIsTarget ||
+                   closest >= distance - 0.05f;
+        }
+
+        private static void CacheVisibilityData(Player player, BodyAnimatorState state)
+        {
+            if (player == null || state == null || player.PlayerBones == null)
+                return;
+            state.Head = player.PlayerBones.Head != null
+                ? player.PlayerBones.Head.Original
+                : null;
+            state.Chest = player.PlayerBones.Ribcage != null
+                ? player.PlayerBones.Ribcage.Original
+                : null;
+            CacheColliderIds(player, state.ColliderIds);
+        }
+
+        private static void CacheColliderIds(Player player, HashSet<int> destination)
+        {
+            destination.Clear();
+            if (player == null)
+                return;
+            foreach (Collider collider in player.GetComponentsInChildren<Collider>(true))
+            {
+                if (collider != null)
+                    destination.Add(collider.GetInstanceID());
+            }
+        }
+
+        private static bool IsPlayerCollider(Collider collider, Player player)
+        {
+            if (collider == null || player == null)
+                return false;
+            BodyPartCollider bodyPart =
+                collider.GetComponentInParent<BodyPartCollider>();
+            if (bodyPart != null &&
+                (ReferenceEquals(bodyPart.Player, player) ||
+                 (bodyPart.Player != null && bodyPart.Player.ProfileId == player.ProfileId)))
+                return true;
+            Player colliderPlayer = collider.GetComponentInParent<Player>();
+            if (ReferenceEquals(colliderPlayer, player))
+                return true;
+            Transform root = player.Transform.Original;
+            Transform hit = collider.transform;
+            return root != null && hit != null &&
+                   (hit == root || hit.IsChildOf(root));
+        }
+
+        private static bool IsAnyPlayerCollider(Collider collider)
+        {
+            if (collider == null)
+                return false;
+            BodyPartCollider bodyPart =
+                collider.GetComponentInParent<BodyPartCollider>();
+            return (bodyPart != null && bodyPart.Player != null) ||
+                   collider.GetComponentInParent<Player>() != null;
+        }
+
+        private bool IsTransparentCollider(Collider collider, int id)
+        {
+            if (_transparentColliderIds.Contains(id)) return true;
+            if (_opaqueColliderIds.Contains(id)) return false;
+            bool transparent = IsRendererlessBoxCollider(collider);
+            (transparent ? _transparentColliderIds : _opaqueColliderIds).Add(id);
+            return transparent;
+        }
+
+        private static bool IsRendererlessBoxCollider(Collider collider)
+        {
+            if (!(collider is BoxCollider))
+                return false;
+            Bounds bounds = collider.bounds;
+            Transform root = collider.transform;
+            for (int depth = 0; root != null && depth < 3; depth++, root = root.parent)
+            {
+                foreach (Renderer renderer in root.GetComponentsInChildren<Renderer>(true))
+                {
+                    if (renderer == null || !renderer.enabled ||
+                        !renderer.gameObject.activeInHierarchy ||
+                        !renderer.bounds.Intersects(bounds))
+                        continue;
+                    foreach (Material material in renderer.sharedMaterials)
+                    {
+                        if (material != null)
+                            return false;
+                    }
+                }
+            }
+            return true;
+        }
+
+        private void OnBodySettingChanged(object sender, EventArgs args)
+        {
+            foreach (BotOwner bot in _bots)
+            {
+                if (bot != null)
+                    UpdateBodyAnimator(bot.GetPlayer, true);
+            }
+        }
+
+        private static void Restore(BodyAnimatorState state)
+        {
+            if (state != null && state.Animator != null)
+                state.Animator.enabled = state.OriginalEnabled;
+        }
+
+        private void RestoreAll()
+        {
+            foreach (BodyAnimatorState state in _bodyStates.Values)
+            {
+                ReleaseCombatCover(state);
+                Restore(state);
+            }
+            _bodyStates.Clear();
+        }
+
+        private void OnDestroy()
+        {
+            RestoreAll();
+            _harmony?.UnpatchSelf();
+            _bots.Clear();
+            _removedBots.Clear();
+            _mainPlayer = null;
+            _camera = null;
+            _gameWorld = null;
+            _looseLoot.Clear();
+            _lootReservations.Clear();
+            if (_instance == this)
+                _instance = null;
+        }
+    }
+}
