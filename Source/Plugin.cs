@@ -15,7 +15,7 @@ namespace AdaptiveBotCulling
     {
         public const string Guid = "com.hysocs.adaptivebotculling";
         public const string Name = "Adaptive Bot Culling";
-        public const string Version = "1.0.0";
+        public const string Version = "1.1.0";
 
         private const float VisibilityHoldSeconds = 1.5f;
 
@@ -55,6 +55,7 @@ namespace AdaptiveBotCulling
         private ConfigEntry<bool> _disableAi;
         private ConfigEntry<bool> _onlySuppressCulledBots;
         private ConfigEntry<bool> _disableBodyAnimator;
+        private ConfigEntry<bool> _useVisibilityRaycasts;
         private Harmony _harmony;
         private Player _mainPlayer;
         private Camera _camera;
@@ -71,6 +72,9 @@ namespace AdaptiveBotCulling
             _disableBodyAnimator = Config.Bind("Distance culling",
                 "Disable body Animator", true,
                 "Disables EFT's expensive body output Animator while a bot is hidden.");
+            _useVisibilityRaycasts = Config.Bind("Distance culling",
+                "Use supplemental visibility raycasts", false,
+                "Keeps on-screen bots active when a clear head or chest ray is found. Disabled by default; EFT's native Player.IsVisible signal is otherwise used on its own.");
             _disableAi.SettingChanged += OnDisableAiSettingChanged;
             _onlySuppressCulledBots.SettingChanged += OnDisableAiSettingChanged;
             _disableBodyAnimator.SettingChanged += OnBodySettingChanged;
@@ -209,7 +213,8 @@ namespace AdaptiveBotCulling
 
         private void Tick()
         {
-            RefreshCamera();
+            if (_useVisibilityRaycasts.Value)
+                RefreshCamera();
             _removedBots.Clear();
             foreach (BotOwner bot in _bots)
             {
@@ -334,6 +339,12 @@ namespace AdaptiveBotCulling
             bool eftVisible = player.PlayerBody != null && player.IsVisible;
             if (eftVisible)
                 state.ActiveUntil = now + VisibilityHoldSeconds;
+            if (!_useVisibilityRaycasts.Value)
+            {
+                state.RayVisible = false;
+                state.IsVisible = eftVisible || now < state.ActiveUntil;
+                return;
+            }
             if (_camera == null || now < state.NextVisibilityUpdate)
             {
                 state.IsVisible = eftVisible || state.RayVisible ||

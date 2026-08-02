@@ -5,9 +5,9 @@
     <AssemblyName>AdaptiveBotCulling</AssemblyName>
     <LangVersion>latest</LangVersion>
     <Nullable>disable</Nullable>
-    <Version>1.0.0</Version>
-    <AssemblyVersion>1.0.0</AssemblyVersion>
-    <FileVersion>1.0.0</FileVersion>
+    <Version>1.1.0</Version>
+    <AssemblyVersion>1.1.0</AssemblyVersion>
+    <FileVersion>1.1.0</FileVersion>
     <!-- The release ZIP is a build output that Visual Studio's fast check
          cannot track, so always let MSBuild evaluate the packaging target. -->
     <DisableFastUpToDateCheck>true</DisableFastUpToDateCheck>
