@@ -15,7 +15,7 @@ namespace AdaptiveBotCulling
     {
         public const string Guid = "com.hysocs.adaptivebotculling";
         public const string Name = "Adaptive Bot Culling";
-        public const string Version = "1.5.0";
+        public const string Version = "1.0.0";
 
         private const float VisibilityHoldSeconds = 1.5f;
 

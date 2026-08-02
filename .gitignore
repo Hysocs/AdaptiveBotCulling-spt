@@ -485,3 +485,4 @@ $RECYCLE.BIN/
 .analysis/
 .analyses/
 *.md
+dist/

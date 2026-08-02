@@ -5,9 +5,12 @@
     <AssemblyName>AdaptiveBotCulling</AssemblyName>
     <LangVersion>latest</LangVersion>
     <Nullable>disable</Nullable>
-    <Version>1.5.0</Version>
-    <AssemblyVersion>1.5.0</AssemblyVersion>
-    <FileVersion>1.5.0</FileVersion>
+    <Version>1.0.0</Version>
+    <AssemblyVersion>1.0.0</AssemblyVersion>
+    <FileVersion>1.0.0</FileVersion>
+    <!-- The release ZIP is a build output that Visual Studio's fast check
+         cannot track, so always let MSBuild evaluate the packaging target. -->
+    <DisableFastUpToDateCheck>true</DisableFastUpToDateCheck>
   </PropertyGroup>
 
   <ItemGroup>
@@ -48,6 +51,8 @@
 
   <PropertyGroup>
     <AdaptiveBotCullingInstallDir>$(MSBuildProjectDirectory)\..\..\BepInEx\plugins\Hysocs-AdaptiveBotCulling</AdaptiveBotCullingInstallDir>
+    <AdaptiveBotCullingPackageRoot>$(MSBuildProjectDirectory)\dist\AdaptiveBotCulling-$(Version)</AdaptiveBotCullingPackageRoot>
+    <AdaptiveBotCullingPackageZip>$(MSBuildProjectDirectory)\dist\AdaptiveBotCulling-$(Version).zip</AdaptiveBotCullingPackageZip>
   </PropertyGroup>
 
   <Target Name="DeployAdaptiveBotCulling"
@@ -57,5 +62,25 @@
     <Copy SourceFiles="$(TargetPath)"
           DestinationFolder="$(AdaptiveBotCullingInstallDir)"
           SkipUnchangedFiles="true" />
+  </Target>
+
+  <Target Name="CreateAdaptiveBotCullingReleasePackage"
+          AfterTargets="CopyFilesToOutputDirectory"
+          Condition="'$(Configuration)' == 'Release' and '$(SkipPackage)' != 'true'">
+    <RemoveDir Directories="$(AdaptiveBotCullingPackageRoot)" />
+    <Delete Files="$(AdaptiveBotCullingPackageZip)" />
+
+    <MakeDir Directories="$(AdaptiveBotCullingPackageRoot)\BepInEx\plugins\Hysocs-AdaptiveBotCulling" />
+    <Copy SourceFiles="$(TargetPath)"
+          DestinationFolder="$(AdaptiveBotCullingPackageRoot)\BepInEx\plugins\Hysocs-AdaptiveBotCulling" />
+    <Copy SourceFiles="$(MSBuildProjectDirectory)\LICENSE"
+          DestinationFolder="$(AdaptiveBotCullingPackageRoot)\BepInEx\plugins\Hysocs-AdaptiveBotCulling" />
+
+    <ZipDirectory SourceDirectory="$(AdaptiveBotCullingPackageRoot)"
+                  DestinationFile="$(AdaptiveBotCullingPackageZip)"
+                  Overwrite="true" />
+
+    <Message Importance="high"
+             Text="Adaptive Bot Culling release package created: $(AdaptiveBotCullingPackageZip)" />
   </Target>
 </Project>
