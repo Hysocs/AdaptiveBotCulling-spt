@@ -11,46 +11,50 @@
     <!-- The release ZIP is a build output that Visual Studio's fast check
          cannot track, so always let MSBuild evaluate the packaging target. -->
     <DisableFastUpToDateCheck>true</DisableFastUpToDateCheck>
+    <SptRoot Condition="'$(SptRoot)' == ''">C:\SPT\4.1.0</SptRoot>
   </PropertyGroup>
 
   <ItemGroup>
+    <!-- Never compile generated files left by this or another project. -->
+    <Compile Remove="bin\**\*.cs;obj\**\*.cs;dist\**\*.cs" />
+
     <Reference Include="0Harmony">
-      <HintPath>..\..\BepInEx\core\0Harmony.dll</HintPath>
+      <HintPath>$(SptRoot)\BepInEx\core\0Harmony.dll</HintPath>
     </Reference>
     <Reference Include="BepInEx">
-      <HintPath>..\..\BepInEx\core\BepInEx.dll</HintPath>
+      <HintPath>$(SptRoot)\BepInEx\core\BepInEx.dll</HintPath>
     </Reference>
     <Reference Include="Assembly-CSharp">
-      <HintPath>..\..\EscapeFromTarkov_Data\Managed\Assembly-CSharp.dll</HintPath>
+      <HintPath>$(SptRoot)\EscapeFromTarkov_Data\Managed\Assembly-CSharp.dll</HintPath>
     </Reference>
     <Reference Include="UnityEngine">
-      <HintPath>..\..\EscapeFromTarkov_Data\Managed\UnityEngine.dll</HintPath>
+      <HintPath>$(SptRoot)\EscapeFromTarkov_Data\Managed\UnityEngine.dll</HintPath>
     </Reference>
     <Reference Include="UnityEngine.CoreModule">
-      <HintPath>..\..\EscapeFromTarkov_Data\Managed\UnityEngine.CoreModule.dll</HintPath>
+      <HintPath>$(SptRoot)\EscapeFromTarkov_Data\Managed\UnityEngine.CoreModule.dll</HintPath>
     </Reference>
     <Reference Include="UnityEngine.AnimationModule">
-      <HintPath>..\..\EscapeFromTarkov_Data\Managed\UnityEngine.AnimationModule.dll</HintPath>
+      <HintPath>$(SptRoot)\EscapeFromTarkov_Data\Managed\UnityEngine.AnimationModule.dll</HintPath>
     </Reference>
     <Reference Include="UnityEngine.PhysicsModule">
-      <HintPath>..\..\EscapeFromTarkov_Data\Managed\UnityEngine.PhysicsModule.dll</HintPath>
+      <HintPath>$(SptRoot)\EscapeFromTarkov_Data\Managed\UnityEngine.PhysicsModule.dll</HintPath>
     </Reference>
     <Reference Include="UnityEngine.TerrainModule">
-      <HintPath>..\..\EscapeFromTarkov_Data\Managed\UnityEngine.TerrainModule.dll</HintPath>
+      <HintPath>$(SptRoot)\EscapeFromTarkov_Data\Managed\UnityEngine.TerrainModule.dll</HintPath>
     </Reference>
     <Reference Include="UnityEngine.TerrainPhysicsModule">
-      <HintPath>..\..\EscapeFromTarkov_Data\Managed\UnityEngine.TerrainPhysicsModule.dll</HintPath>
+      <HintPath>$(SptRoot)\EscapeFromTarkov_Data\Managed\UnityEngine.TerrainPhysicsModule.dll</HintPath>
     </Reference>
     <Reference Include="UnityEngine.DirectorModule">
-      <HintPath>..\..\EscapeFromTarkov_Data\Managed\UnityEngine.DirectorModule.dll</HintPath>
+      <HintPath>$(SptRoot)\EscapeFromTarkov_Data\Managed\UnityEngine.DirectorModule.dll</HintPath>
     </Reference>
     <Reference Include="UnityEngine.AIModule">
-      <HintPath>..\..\EscapeFromTarkov_Data\Managed\UnityEngine.AIModule.dll</HintPath>
+      <HintPath>$(SptRoot)\EscapeFromTarkov_Data\Managed\UnityEngine.AIModule.dll</HintPath>
     </Reference>
   </ItemGroup>
 
   <PropertyGroup>
-    <AdaptiveBotCullingInstallDir>$(MSBuildProjectDirectory)\..\..\BepInEx\plugins\Hysocs-AdaptiveBotCulling</AdaptiveBotCullingInstallDir>
+    <AdaptiveBotCullingInstallDir>$(SptRoot)\BepInEx\plugins\Hysocs-AdaptiveBotCulling</AdaptiveBotCullingInstallDir>
     <AdaptiveBotCullingPackageRoot>$(MSBuildProjectDirectory)\dist\AdaptiveBotCulling-$(Version)</AdaptiveBotCullingPackageRoot>
     <AdaptiveBotCullingPackageZip>$(MSBuildProjectDirectory)\dist\AdaptiveBotCulling-$(Version).zip</AdaptiveBotCullingPackageZip>
   </PropertyGroup>
@@ -74,6 +78,8 @@
     <Copy SourceFiles="$(TargetPath)"
           DestinationFolder="$(AdaptiveBotCullingPackageRoot)\BepInEx\plugins\Hysocs-AdaptiveBotCulling" />
     <Copy SourceFiles="$(MSBuildProjectDirectory)\LICENSE"
+          DestinationFolder="$(AdaptiveBotCullingPackageRoot)\BepInEx\plugins\Hysocs-AdaptiveBotCulling" />
+    <Copy SourceFiles="$(MSBuildProjectDirectory)\README.md"
           DestinationFolder="$(AdaptiveBotCullingPackageRoot)\BepInEx\plugins\Hysocs-AdaptiveBotCulling" />
 
     <ZipDirectory SourceDirectory="$(AdaptiveBotCullingPackageRoot)"

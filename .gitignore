@@ -485,4 +485,5 @@ $RECYCLE.BIN/
 .analysis/
 .analyses/
 *.md
+!README.md
 dist/
