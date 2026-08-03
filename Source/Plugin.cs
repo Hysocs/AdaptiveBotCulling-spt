@@ -1,4 +1,5 @@
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.Reflection;
 using BepInEx;
@@ -7,7 +8,6 @@ using EFT;
 using FastAnimatorSystem;
 using HarmonyLib;
 using UnityEngine;
-
 namespace AdaptiveBotCulling
 {
     [BepInPlugin(Guid, Name, Version)]
@@ -19,21 +19,19 @@ namespace AdaptiveBotCulling
 
         private const float VisibilityHoldSeconds = 1.5f;
 
-        private static readonly int VisibilityMask = BuildVisibilityMask();
-
         private sealed class BodyAnimatorState
         {
+            public BotOwner Owner;
             public Animator Animator;
             public bool OriginalEnabled;
             public float NextRefresh;
-            public float NextVisibilityUpdate;
-            public Transform Head;
-            public Transform Chest;
+            public bool HasVisibility;
+            public bool EftVisible;
             public bool IsVisible;
-            public bool RayVisible;
-            public float ActiveUntil;
+            public int VisibilityGeneration;
             public bool MovementStopped;
-            public readonly HashSet<int> ColliderIds = new HashSet<int>();
+            public readonly HashSet<AudioSource> PausedAudioSources =
+                new HashSet<AudioSource>();
         }
 
         private static Plugin _instance;
@@ -47,19 +45,15 @@ namespace AdaptiveBotCulling
         private readonly List<BotOwner> _removedBots = new List<BotOwner>();
         private readonly Dictionary<Player, BodyAnimatorState> _bodyStates =
             new Dictionary<Player, BodyAnimatorState>();
-        private readonly RaycastHit[] _visibilityHits = new RaycastHit[64];
-        private readonly HashSet<int> _localPlayerColliderIds = new HashSet<int>();
-        private readonly HashSet<int> _transparentColliderIds = new HashSet<int>();
-        private readonly HashSet<int> _opaqueColliderIds = new HashSet<int>();
-
+        private readonly Dictionary<LookSensor, Player> _lookSensorPlayers =
+            new Dictionary<LookSensor, Player>();
         private ConfigEntry<bool> _disableAi;
         private ConfigEntry<bool> _onlySuppressCulledBots;
         private ConfigEntry<bool> _disableBodyAnimator;
-        private ConfigEntry<bool> _useVisibilityRaycasts;
+        private ConfigEntry<bool> _pauseAudioSources;
+        private ConfigEntry<bool> _disablePeriodicLookSensing;
         private Harmony _harmony;
-        private Player _mainPlayer;
-        private Camera _camera;
-        private float _nextCameraRefresh;
+        private float _nextMaintenance;
 
         private void Awake()
         {
@@ -72,12 +66,16 @@ namespace AdaptiveBotCulling
             _disableBodyAnimator = Config.Bind("Distance culling",
                 "Disable body Animator", true,
                 "Disables EFT's expensive body output Animator while a bot is hidden.");
-            _useVisibilityRaycasts = Config.Bind("Distance culling",
-                "Use supplemental visibility raycasts", false,
-                "Keeps on-screen bots active when a clear head or chest ray is found. Disabled by default; EFT's native Player.IsVisible signal is otherwise used on its own.");
+            _pauseAudioSources = Config.Bind("Experimental native culling",
+                "Pause AudioSources", true,
+                "Pauses playing looping Unity AudioSource components while a bot is culled and resumes only sources paused by this mod.");
+            _disablePeriodicLookSensing = Config.Bind("Distance culling",
+                "Disable periodic look sensing while culled", true,
+                "Skips the global AI task scheduler's enemy visibility, weather, light, reporting, and goal checks for culled bots.");
             _disableAi.SettingChanged += OnDisableAiSettingChanged;
             _onlySuppressCulledBots.SettingChanged += OnDisableAiSettingChanged;
             _disableBodyAnimator.SettingChanged += OnBodySettingChanged;
+            _pauseAudioSources.SettingChanged += OnBodySettingChanged;
 
             _harmony = new Harmony(Guid);
             Patch(AccessTools.Method(typeof(BotOwner), nameof(BotOwner.PreActivate)), nameof(RegisterBot), false);
@@ -86,6 +84,10 @@ namespace AdaptiveBotCulling
             Patch(AccessTools.Method(typeof(BotOwner), nameof(BotOwner.FixedUpdate)), nameof(AllowBotFixedUpdate), true);
             Patch(AccessTools.Method(typeof(AICoreAgent<BotLogicDecision>),
                 nameof(AICoreAgent<BotLogicDecision>.Update)), nameof(AllowBrainUpdate), true);
+            Patch(AccessTools.PropertyGetter(typeof(Player),
+                nameof(Player.IsVisible)), nameof(OnEftVisibilityEvaluated), false);
+            Patch(GetLookSensorPeriodicUpdate(),
+                nameof(AllowPeriodicLookSensing), true);
             Patch(AccessTools.Method(typeof(Player), nameof(Player.OnDead),
                 new[] { typeof(EDamageType) }), nameof(PrepareDeathPose), true);
             Patch(AccessTools.Method(typeof(Player), nameof(Player.CreateCorpse),
@@ -93,7 +95,7 @@ namespace AdaptiveBotCulling
             Patch(AccessTools.Method(typeof(GameWorld), nameof(GameWorld.DoWorldTick)), nameof(OnWorldTick), false);
 
             Logger.LogInfo(Name + " " + Version +
-                " loaded: original AI suppression and hidden Animator culling only.");
+                " loaded: event-driven EFT visibility, AI suppression, and hidden Animator culling.");
         }
 
         private void Patch(MethodBase target, string methodName, bool prefix)
@@ -108,6 +110,24 @@ namespace AdaptiveBotCulling
             _harmony.Patch(target, prefix ? patch : null, prefix ? null : patch);
         }
 
+        private static MethodInfo GetLookSensorPeriodicUpdate()
+        {
+            foreach (Type contract in typeof(LookSensor).GetInterfaces())
+            {
+                MethodInfo[] methods = contract.GetMethods();
+                if (methods.Length != 1 || methods[0].ReturnType != typeof(void))
+                    continue;
+                ParameterInfo[] parameters = methods[0].GetParameters();
+                if (parameters.Length != 1 ||
+                    parameters[0].ParameterType != typeof(float))
+                    continue;
+                InterfaceMapping mapping = typeof(LookSensor)
+                    .GetInterfaceMap(contract);
+                return mapping.TargetMethods[0];
+            }
+            return null;
+        }
+
         private static void RegisterBot(BotOwner __instance)
         {
             if (_instance != null && __instance != null)
@@ -120,9 +140,28 @@ namespace AdaptiveBotCulling
                 return;
             _instance._bots.Add(__instance);
             Player player = __instance.GetPlayer;
+            _instance.EnsureState(player, __instance);
+            if (__instance.LookSensor != null && player != null)
+                _instance._lookSensorPlayers[__instance.LookSensor] = player;
             _instance.UpdateBodyAnimator(player, true);
-            _instance.UpdateVisibility(player);
+            if (player != null)
+                _instance.ReceiveEftVisibility(player, player.IsVisible);
             _instance.UpdateBotSuppression(__instance, player);
+        }
+
+        private static void OnEftVisibilityEvaluated(Player __instance,
+            bool __result)
+        {
+            _instance?.ReceiveEftVisibility(__instance, __result);
+        }
+
+        private static bool AllowPeriodicLookSensing(LookSensor __instance)
+        {
+            if (_instance == null || __instance == null ||
+                !_instance._disablePeriodicLookSensing.Value)
+                return true;
+            return !_instance._lookSensorPlayers.TryGetValue(__instance,
+                       out Player player) || !_instance.IsCulled(player);
         }
 
         private static bool AllowBotManualUpdate(BotOwner __instance)
@@ -175,18 +214,6 @@ namespace AdaptiveBotCulling
             return brain == null || !_instance.ShouldDisableAi(player);
         }
 
-        private static int BuildVisibilityMask()
-        {
-            int mask = Physics.DefaultRaycastLayers;
-            foreach (string layerName in new[] { "Grass", "Foliage" })
-            {
-                int layer = LayerMask.NameToLayer(layerName);
-                if (layer >= 0)
-                    mask &= ~(1 << layer);
-            }
-            return mask;
-        }
-
         private static void PrepareDeathPose(Player __instance)
         {
             _instance?.WakeAndStampDeathPose(__instance, true);
@@ -204,17 +231,14 @@ namespace AdaptiveBotCulling
         {
             if (_instance == null)
                 return;
-            Player nextMainPlayer = __instance != null
-                ? __instance.MainPlayer : null;
-            if (_instance._mainPlayer != nextMainPlayer)
-                _instance.AttachMainPlayer(nextMainPlayer);
-            _instance.Tick();
+            _instance.MaintenanceTick();
         }
 
-        private void Tick()
+        private void MaintenanceTick()
         {
-            if (_useVisibilityRaycasts.Value)
-                RefreshCamera();
+            if (Time.unscaledTime < _nextMaintenance)
+                return;
+            _nextMaintenance = Time.unscaledTime + 1f;
             _removedBots.Clear();
             foreach (BotOwner bot in _bots)
             {
@@ -226,8 +250,6 @@ namespace AdaptiveBotCulling
                 Player player = bot.GetPlayer;
                 if (!IsAlive(player))
                     continue;
-                UpdateVisibility(player);
-                UpdateBotSuppression(bot, player);
                 UpdateBodyAnimator(player, false);
             }
             foreach (BotOwner bot in _removedBots)
@@ -263,7 +285,8 @@ namespace AdaptiveBotCulling
         private void PrepareBotForGlobalSuppression(BotOwner bot,
             Player player, bool force)
         {
-            if (bot == null || player == null || !_disableAi.Value ||
+            if (bot == null || player == null ||
+                !_disableAi.Value ||
                 !IsAlive(player))
                 return;
             if (!_bodyStates.TryGetValue(player, out BodyAnimatorState state))
@@ -288,136 +311,57 @@ namespace AdaptiveBotCulling
             state.MovementStopped = true;
         }
 
-        private void AttachMainPlayer(Player player)
+        private BodyAnimatorState EnsureState(Player player,
+            BotOwner owner = null)
         {
-            _mainPlayer = player;
-            _localPlayerColliderIds.Clear();
-            _transparentColliderIds.Clear();
-            _opaqueColliderIds.Clear();
-            CacheColliderIds(player, _localPlayerColliderIds);
-        }
-
-        private void RefreshCamera()
-        {
-            if (_camera != null && _camera.enabled &&
-                _camera.gameObject.activeInHierarchy &&
-                _camera.targetTexture == null)
-                return;
-            if (Time.unscaledTime < _nextCameraRefresh)
-                return;
-            _nextCameraRefresh = Time.unscaledTime + 1f;
-            Camera best = null;
-            float bestScore = float.MinValue;
-            foreach (Camera candidate in Resources.FindObjectsOfTypeAll<Camera>())
-            {
-                if (candidate == null || !candidate.enabled ||
-                    !candidate.gameObject.activeInHierarchy ||
-                    candidate.orthographic || candidate.targetTexture != null)
-                    continue;
-                float score = candidate.depth;
-                if (candidate.CompareTag("MainCamera")) score += 500f;
-                if (candidate.name.IndexOf("FPS",
-                        StringComparison.OrdinalIgnoreCase) >= 0) score += 1000f;
-                if (score > bestScore)
-                {
-                    best = candidate;
-                    bestScore = score;
-                }
-            }
-            _camera = best != null ? best : Camera.main;
-        }
-
-        private void UpdateVisibility(Player player)
-        {
+            if (player == null)
+                return null;
             if (!_bodyStates.TryGetValue(player, out BodyAnimatorState state))
             {
-                state = new BodyAnimatorState();
+                state = new BodyAnimatorState { IsVisible = true };
                 _bodyStates.Add(player, state);
-                CacheVisibilityData(player, state);
             }
-            float now = Time.unscaledTime;
-            bool eftVisible = player.PlayerBody != null && player.IsVisible;
-            if (eftVisible)
-                state.ActiveUntil = now + VisibilityHoldSeconds;
-            if (!_useVisibilityRaycasts.Value)
-            {
-                state.RayVisible = false;
-                state.IsVisible = eftVisible || now < state.ActiveUntil;
-                return;
-            }
-            if (_camera == null || now < state.NextVisibilityUpdate)
-            {
-                state.IsVisible = eftVisible || state.RayVisible ||
-                    now < state.ActiveUntil;
-                return;
-            }
-            float distance = (player.Position -
-                _camera.transform.position).magnitude;
-            float rate = distance <= 100f ? 10f : 4f;
-            state.NextVisibilityUpdate = now + 1f / rate +
-                (player.GetInstanceID() & 3) * 0.001f;
-            if (!IsOnScreen(state.Head) && !IsOnScreen(state.Chest))
-            {
-                state.RayVisible = false;
-                state.IsVisible = eftVisible || now < state.ActiveUntil;
-                return;
-            }
-            state.RayVisible = IsPointVisible(player, state, state.Head) ||
-                IsPointVisible(player, state, state.Chest);
-            if (state.RayVisible)
-                state.ActiveUntil = now + VisibilityHoldSeconds;
-            state.IsVisible = eftVisible || state.RayVisible ||
-                now < state.ActiveUntil;
+            if (owner != null)
+                state.Owner = owner;
+            return state;
         }
 
-        private bool IsOnScreen(Transform point)
+        private void ReceiveEftVisibility(Player player, bool visible)
         {
-            if (point == null || _camera == null)
-                return false;
-            Vector3 viewport = _camera.WorldToViewportPoint(point.position);
-            return viewport.z > 0f && viewport.x >= 0f && viewport.x <= 1f &&
-                   viewport.y >= 0f && viewport.y <= 1f;
+            if (player == null || player.IsYourPlayer)
+                return;
+            BodyAnimatorState state = EnsureState(player);
+            if (state.HasVisibility && state.EftVisible == visible)
+                return;
+            state.HasVisibility = true;
+            state.EftVisible = visible;
+            int generation = ++state.VisibilityGeneration;
+            if (visible || !IsAlive(player))
+            {
+                ApplyVisibility(player, state, true);
+                return;
+            }
+            StartCoroutine(CullAfterHold(player, state, generation));
         }
 
-        private bool IsPointVisible(Player target, BodyAnimatorState state,
-            Transform point)
+        private IEnumerator CullAfterHold(Player player,
+            BodyAnimatorState state, int generation)
         {
-            if (point == null || _camera == null)
-                return false;
-            Vector3 origin = _camera.transform.position;
-            Vector3 delta = point.position - origin;
-            float distance = delta.magnitude;
-            if (distance <= 0.05f)
-                return true;
-            int count = Physics.RaycastNonAlloc(origin, delta / distance,
-                _visibilityHits, distance + 0.05f, VisibilityMask,
-                QueryTriggerInteraction.Ignore);
-            if (count == 0)
-                return true;
-            float closest = float.MaxValue;
-            bool closestIsTarget = false;
-            for (int i = 0; i < count; i++)
-            {
-                Collider collider = _visibilityHits[i].collider;
-                if (collider == null)
-                    continue;
-                int id = collider.GetInstanceID();
-                if (_localPlayerColliderIds.Contains(id) ||
-                    IsPlayerCollider(collider, _mainPlayer) ||
-                    IsTransparentCollider(collider, id))
-                    continue;
-                float hitDistance = _visibilityHits[i].distance;
-                if (hitDistance >= closest)
-                    continue;
-                bool belongs = state.ColliderIds.Contains(id) ||
-                    IsPlayerCollider(collider, target);
-                if (!belongs && IsAnyPlayerCollider(collider))
-                    continue;
-                closest = hitDistance;
-                closestIsTarget = belongs;
-            }
-            return closest == float.MaxValue || closestIsTarget ||
-                   closest >= distance - 0.05f;
+            yield return new WaitForSecondsRealtime(VisibilityHoldSeconds);
+            if (player != null && state != null &&
+                state.VisibilityGeneration == generation &&
+                !state.EftVisible && IsAlive(player))
+                ApplyVisibility(player, state, false);
+        }
+
+        private void ApplyVisibility(Player player, BodyAnimatorState state,
+            bool visible)
+        {
+            if (state.IsVisible == visible)
+                return;
+            state.IsVisible = visible;
+            UpdateBotSuppression(state.Owner, player);
+            UpdateBodyAnimator(player, false);
         }
 
         private void UpdateBodyAnimator(Player player, bool forceRefresh)
@@ -442,90 +386,48 @@ namespace AdaptiveBotCulling
                     state.Animator = current;
                     state.OriginalEnabled = current.enabled;
                 }
-                CacheVisibilityData(player, state);
                 state.NextRefresh = Time.unscaledTime + 1f;
             }
             if (state.Animator != null)
                 state.Animator.enabled = state.OriginalEnabled &&
                     (!_disableBodyAnimator.Value || state.IsVisible);
+            UpdateAudioSources(player, state);
         }
 
-        private static void CacheVisibilityData(Player player,
+        private void UpdateAudioSources(Player player,
             BodyAnimatorState state)
         {
-            if (player == null || state == null || player.PlayerBones == null)
-                return;
-            state.Head = player.PlayerBones.Head != null
-                ? player.PlayerBones.Head.Original : null;
-            state.Chest = player.PlayerBones.Ribcage != null
-                ? player.PlayerBones.Ribcage.Original : null;
-            CacheColliderIds(player, state.ColliderIds);
-        }
-
-        private static void CacheColliderIds(Player player,
-            HashSet<int> destination)
-        {
-            destination.Clear();
-            if (player == null)
-                return;
-            foreach (Collider collider in
-                     player.GetComponentsInChildren<Collider>(true))
-                if (collider != null)
-                    destination.Add(collider.GetInstanceID());
-        }
-
-        private static bool IsPlayerCollider(Collider collider, Player player)
-        {
-            if (collider == null || player == null)
-                return false;
-            BodyPartCollider body = collider.GetComponentInParent<BodyPartCollider>();
-            if (body != null && body.Player != null &&
-                body.Player.ProfileId == player.ProfileId)
-                return true;
-            Player colliderPlayer = collider.GetComponentInParent<Player>();
-            return colliderPlayer == player;
-        }
-
-        private static bool IsAnyPlayerCollider(Collider collider)
-        {
-            if (collider == null)
-                return false;
-            BodyPartCollider body = collider.GetComponentInParent<BodyPartCollider>();
-            return (body != null && body.Player != null) ||
-                   collider.GetComponentInParent<Player>() != null;
-        }
-
-        private bool IsTransparentCollider(Collider collider, int id)
-        {
-            if (_transparentColliderIds.Contains(id)) return true;
-            if (_opaqueColliderIds.Contains(id)) return false;
-            bool transparent = IsRendererlessBoxCollider(collider);
-            (transparent ? _transparentColliderIds : _opaqueColliderIds).Add(id);
-            return transparent;
-        }
-
-        private static bool IsRendererlessBoxCollider(Collider collider)
-        {
-            if (!(collider is BoxCollider))
-                return false;
-            Bounds bounds = collider.bounds;
-            Transform root = collider.transform;
-            for (int depth = 0; root != null && depth < 3;
-                 depth++, root = root.parent)
+            bool shouldPause = _pauseAudioSources.Value && !state.IsVisible;
+            if (shouldPause)
             {
-                foreach (Renderer renderer in
-                         root.GetComponentsInChildren<Renderer>(true))
+                foreach (AudioSource source in
+                         player.GetComponentsInChildren<AudioSource>(true))
                 {
-                    if (renderer == null || !renderer.enabled ||
-                        !renderer.gameObject.activeInHierarchy ||
-                        !renderer.bounds.Intersects(bounds))
+                    if (source == null || !source.loop || !source.isPlaying ||
+                        state.PausedAudioSources.Contains(source))
                         continue;
-                    foreach (Material material in renderer.sharedMaterials)
-                        if (material != null)
-                            return false;
+                    source.Pause();
+                    state.PausedAudioSources.Add(source);
                 }
+                return;
             }
-            return true;
+            ResumeAudioSources(state);
+        }
+
+        private static void ResumeAudioSources(BodyAnimatorState state)
+        {
+            foreach (AudioSource source in state.PausedAudioSources)
+                if (source != null)
+                    source.UnPause();
+            state.PausedAudioSources.Clear();
+        }
+
+        private bool IsCulled(Player player)
+        {
+            return IsAlive(player) &&
+                   _bodyStates.TryGetValue(player,
+                       out BodyAnimatorState state) &&
+                   !state.IsVisible;
         }
 
         private void WakeAndStampDeathPose(Player player, bool advanceState)
@@ -535,9 +437,10 @@ namespace AdaptiveBotCulling
                 return;
             if (_bodyStates.TryGetValue(player, out BodyAnimatorState state))
             {
+                state.VisibilityGeneration++;
+                state.HasVisibility = true;
+                state.EftVisible = true;
                 state.IsVisible = true;
-                state.RayVisible = true;
-                state.ActiveUntil = float.PositiveInfinity;
                 Restore(state);
             }
             PlayableAnimator playable = player.PlayerBones.PlayableAnimator;
@@ -608,8 +511,11 @@ namespace AdaptiveBotCulling
 
         private static void Restore(BodyAnimatorState state)
         {
-            if (state != null && state.Animator != null)
+            if (state == null)
+                return;
+            if (state.Animator != null)
                 state.Animator.enabled = state.OriginalEnabled;
+            ResumeAudioSources(state);
         }
 
         private void OnDestroy()
@@ -618,21 +524,21 @@ namespace AdaptiveBotCulling
                 _disableAi.SettingChanged -= OnDisableAiSettingChanged;
             if (_disableBodyAnimator != null)
                 _disableBodyAnimator.SettingChanged -= OnBodySettingChanged;
+            if (_pauseAudioSources != null)
+                _pauseAudioSources.SettingChanged -= OnBodySettingChanged;
             if (_onlySuppressCulledBots != null)
                 _onlySuppressCulledBots.SettingChanged -= OnDisableAiSettingChanged;
+            StopAllCoroutines();
             foreach (BodyAnimatorState state in _bodyStates.Values)
                 Restore(state);
             _bodyStates.Clear();
             _harmony?.UnpatchSelf();
             _bots.Clear();
             _removedBots.Clear();
-            _mainPlayer = null;
-            _camera = null;
-            _localPlayerColliderIds.Clear();
-            _transparentColliderIds.Clear();
-            _opaqueColliderIds.Clear();
+            _lookSensorPlayers.Clear();
             if (_instance == this)
                 _instance = null;
         }
     }
 }
+
